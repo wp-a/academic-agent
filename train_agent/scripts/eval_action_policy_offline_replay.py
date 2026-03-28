@@ -4,15 +4,36 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from datasets import load_dataset
 
 from train_agent.data.adapters.scifact import build_scifact_restricted_episode
 from train_agent.models.action_policy import FrozenActionPolicy
+from train_agent.models.stop_policy import FrozenStopPolicy
 from train_agent.models.verifier import FrozenSequenceVerifier
 from train_agent.rl.restricted_retrieval import RestrictedRetrievalEpisode, RestrictedRetrievalEnv
 from train_agent.scripts.export_scifact_frozen_verifier_replay import WeakCoupledReplayPolicy, build_scifact_corpus_map
+
+
+def choose_action_with_optional_stop_suppression(action_policy, state_text: str) -> Tuple[str, bool]:
+    if hasattr(action_policy, "predict_logits") and hasattr(action_policy, "label_names"):
+        logits = action_policy.predict_logits([state_text])[0]
+        label_names = list(action_policy.label_names)
+        ranked_indices = sorted(range(len(logits)), key=lambda idx: logits[idx], reverse=True)
+        top_label = label_names[ranked_indices[0]]
+        if top_label != "stop":
+            return top_label, False
+        for idx in ranked_indices[1:]:
+            label = label_names[idx]
+            if label != "stop":
+                return label, True
+        raise ValueError("Action policy has no non-stop label to fall back to.")
+
+    predicted_action = action_policy.predict_action(state_text)
+    if predicted_action == "stop":
+        raise ValueError("Action policy predicted stop but does not expose logits for non-stop fallback.")
+    return predicted_action, False
 
 
 def evaluate_policy_on_episodes(
@@ -20,6 +41,7 @@ def evaluate_policy_on_episodes(
     *,
     verifier: FrozenSequenceVerifier,
     action_policy: FrozenActionPolicy,
+    stop_policy: Optional[FrozenStopPolicy] = None,
     reference_policy: Optional[WeakCoupledReplayPolicy] = None,
     doc_aggregation: str = "full_document",
     aggregation_top_k: int = 3,
@@ -35,6 +57,9 @@ def evaluate_policy_on_episodes(
     quote_hits = 0
     successes = 0
     early_stops = 0
+    stop_policy_yes_count = 0
+    stop_policy_no_count = 0
+    suppressed_stop_count = 0
     action_counts: Counter = Counter()
 
     for episode in episodes:
@@ -48,8 +73,19 @@ def evaluate_policy_on_episodes(
         done = False
         episode_count += 1
         while not done:
+            state_text = state.to_text()
             reference_action = reference_policy.choose_action(state)
-            predicted_action = action_policy.predict_action(state.to_text())
+            if stop_policy is not None:
+                if stop_policy.predict_should_stop(state_text):
+                    predicted_action = "stop"
+                    stop_policy_yes_count += 1
+                else:
+                    predicted_action, suppressed_stop = choose_action_with_optional_stop_suppression(action_policy, state_text)
+                    stop_policy_no_count += 1
+                    suppressed_stop_count += int(suppressed_stop)
+            else:
+                predicted_action = action_policy.predict_action(state_text)
+
             total_steps += 1
             action_counts[predicted_action] += 1
             agreement += int(predicted_action == reference_action)
@@ -68,7 +104,7 @@ def evaluate_policy_on_episodes(
             state = result.state
             done = result.done
 
-    return {
+    summary = {
         "episodes": episode_count,
         "num_actions": total_steps,
         "action_agreement": round(agreement / max(total_steps, 1), 6),
@@ -81,18 +117,26 @@ def evaluate_policy_on_episodes(
         "action_distribution": {
             action: round(count / max(total_steps, 1), 6) for action, count in sorted(action_counts.items())
         },
+        "used_stop_policy": bool(stop_policy is not None),
+        "stop_policy_yes_count": stop_policy_yes_count,
+        "stop_policy_no_count": stop_policy_no_count,
+        "suppressed_stop_count": suppressed_stop_count,
     }
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--policy_model_dir", type=Path, required=True)
+    parser.add_argument("--stop_model_dir", type=Path)
     parser.add_argument("--verifier_model_name_or_path", required=True)
     parser.add_argument("--output_path", type=Path, required=True)
     parser.add_argument("--split", default="validation")
     parser.add_argument("--max_steps", type=int, default=4)
     parser.add_argument("--policy_max_length", type=int, default=768)
     parser.add_argument("--policy_batch_size", type=int, default=8)
+    parser.add_argument("--stop_max_length", type=int, default=512)
+    parser.add_argument("--stop_batch_size", type=int, default=8)
     parser.add_argument("--verifier_max_length", type=int, default=384)
     parser.add_argument("--verifier_batch_size", type=int, default=8)
     parser.add_argument("--attn_implementation", default="sdpa")
@@ -127,10 +171,19 @@ def main() -> None:
         batch_size=args.policy_batch_size,
         attn_implementation=args.attn_implementation,
     )
+    stop_policy = None
+    if args.stop_model_dir is not None:
+        stop_policy = FrozenStopPolicy(
+            args.stop_model_dir,
+            max_length=args.stop_max_length,
+            batch_size=args.stop_batch_size,
+            attn_implementation=args.attn_implementation,
+        )
     summary = evaluate_policy_on_episodes(
         episodes,
         verifier=verifier,
         action_policy=action_policy,
+        stop_policy=stop_policy,
         doc_aggregation=args.doc_aggregation,
         aggregation_top_k=args.aggregation_top_k,
     )
@@ -138,6 +191,7 @@ def main() -> None:
         {
             "split": args.split,
             "policy_model_dir": str(args.policy_model_dir),
+            "stop_model_dir": str(args.stop_model_dir) if args.stop_model_dir is not None else "",
             "verifier_model_name_or_path": args.verifier_model_name_or_path,
             "doc_aggregation": args.doc_aggregation,
             "aggregation_top_k": args.aggregation_top_k,

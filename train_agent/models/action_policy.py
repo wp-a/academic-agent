@@ -40,12 +40,50 @@ class FrozenActionPolicy:
         self.model.to(self.device)
 
     @staticmethod
-    def _load_label_names(model_name_or_path: str) -> List[str]:
-        label_path = Path(model_name_or_path) / "label_names.json"
-        if not label_path.exists():
-            raise FileNotFoundError(f"Missing label_names.json under {model_name_or_path}")
-        with label_path.open("r", encoding="utf-8") as handle:
-            return list(json.load(handle))
+    def _candidate_dirs(model_name_or_path: str) -> List[Path]:
+        model_path = Path(model_name_or_path)
+        candidates = [model_path]
+        if model_path.parent != model_path:
+            candidates.append(model_path.parent)
+        return candidates
+
+    @classmethod
+    def _load_label_names(cls, model_name_or_path: str) -> List[str]:
+        for candidate_dir in cls._candidate_dirs(model_name_or_path):
+            label_path = candidate_dir / "label_names.json"
+            if label_path.exists():
+                with label_path.open("r", encoding="utf-8") as handle:
+                    return list(json.load(handle))
+
+        for candidate_dir in cls._candidate_dirs(model_name_or_path):
+            config_path = candidate_dir / "config.json"
+            if not config_path.exists():
+                continue
+            with config_path.open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+            label_names = cls._load_label_names_from_config(config)
+            if label_names:
+                return label_names
+
+        raise FileNotFoundError(
+            f"Missing label_names.json under {model_name_or_path} and no usable label map found in nearby config.json"
+        )
+
+    @staticmethod
+    def _load_label_names_from_config(config: dict) -> List[str]:
+        id2label = config.get("id2label") or {}
+        if id2label:
+            normalized = {int(key): str(value) for key, value in id2label.items()}
+            ordered = [normalized[idx] for idx in sorted(normalized)]
+            if ordered and not all(label.startswith("LABEL_") for label in ordered):
+                return ordered
+        label2id = config.get("label2id") or {}
+        if label2id:
+            ordered_pairs = sorted(((str(label), int(idx)) for label, idx in label2id.items()), key=lambda item: item[1])
+            ordered = [label for label, _ in ordered_pairs]
+            if ordered and not all(label.startswith("LABEL_") for label in ordered):
+                return ordered
+        return []
 
     @staticmethod
     def _is_peft_adapter(model_name_or_path: str) -> bool:

@@ -6,6 +6,7 @@
 
 - `verifier`：在受限文档集合内对证据相关性和立场进行判别与排序
 - `action policy`：在 frozen verifier 提供的状态下，学习 `search / quote_evidence / stop`
+- `stop policy`：在 frozen verifier 提供的状态下，学习 `should_stop = yes / no`
 - `restricted env`：用于离线 replay、ranking 评测和后续更正式主循环接入
 
 当前已经完成：
@@ -15,6 +16,8 @@
 - weakly-coupled action policy 数据导出
 - action policy 小分类 baseline
 - `Qwen2.5-3B-Instruct` LoRA action policy 主线
+- SciFact stop-policy replay 数据导出
+- `Qwen2.5-3B-Instruct` LoRA stop policy 主线
 - action-level 与 episode-level offline replay 评测
 
 当前明确不做：
@@ -37,9 +40,9 @@
 当前的工程策略是：
 
 1. 先冻结一个足够稳定的 verifier
-2. 基于 frozen verifier 导出 action policy replay 数据
+2. 基于 frozen verifier 导出 action policy / stop policy replay 数据
 3. 先做 offline imitation / replay 验证
-4. 等 action policy 与 restricted env 的接口跑稳，再讨论更正式的 agent loop
+4. 等 action policy 与 stop policy 和 restricted env 的接口跑稳，再讨论更正式的 agent loop
 
 ## 2. 当前主线状态
 
@@ -72,7 +75,26 @@
 - 小分类 baseline：`prajjwal1/bert-tiny`
 - 主力 baseline：`Qwen2.5-3B-Instruct` + LoRA
 
-### 2.3 评测方式
+### 2.3 Stop Policy 主线
+
+当前 stop policy 是一个二分类任务：
+
+- `no`
+- `yes`
+
+输入也是 verifier 驱动环境状态的 `state_text`，输出是离散 `should_stop`。
+
+当前已经跑通：
+
+- SciFact weakly-coupled replay stop 数据导出
+- `Qwen2.5-3B-Instruct` + LoRA stop policy 四卡训练
+
+当前最新验证结果：
+
+- validation `accuracy = 1.0`
+- validation `macro_f1 = 1.0`
+
+### 2.4 评测方式
 
 当前 action policy 不是看生成文本，而是看两层指标：
 
@@ -81,6 +103,8 @@
    - `macro_f1`
    - per-action `precision / recall / f1`
    - confusion matrix
+   - gold / prediction distribution
+   - per-example prediction / error export
 2. episode-level offline replay
    - `action_agreement`
    - `average_steps`
@@ -109,6 +133,8 @@
 - `train_agent/scripts/`
   - SciFact verifier 数据导出
   - action policy replay 数据导出
+  - stop policy replay 数据导出
+  - step-level classification 评测与错例导出
   - offline replay 评测
   - inference / utility 脚本
 - `train_agent/rl/`
@@ -214,7 +240,13 @@ PY"
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0,1,2,3 && /root/miniconda3/bin/torchrun --nproc_per_node=4 -m train_agent.trainers.train_action_policy --train_file data/processed/scifact_action_policy_v1/scifact_action_policy_train.jsonl --eval_file data/processed/scifact_action_policy_v1/scifact_action_policy_validation.jsonl --model_name_or_path /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1 --output_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --max_length 512 --num_train_epochs 1 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --gradient_accumulation_steps 8 --learning_rate 1e-4 --logging_steps 10 --eval_steps 50 --save_steps 50 --attn_implementation sdpa --use_lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --lora_target_modules q_proj,k_proj,v_proj,o_proj --lora_modules_to_save score --gradient_checkpointing"
 ```
 
-### 7.5 运行 action policy offline replay 评测
+### 7.5 运行 action policy step-level 评测
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_predictions --model_dir outputs/action_policy_scifact_bert_tiny_v1 --eval_file data/processed/scifact_action_policy_v1/scifact_action_policy_validation.jsonl --output_path outputs/action_policy_scifact_bert_tiny_v1/step_eval_validation.json --errors_output_path outputs/action_policy_scifact_bert_tiny_v1/step_eval_validation_errors.json --max_length 256 --batch_size 32"
+```
+
+### 7.6 运行 action policy offline replay 评测
 
 小模型：
 
@@ -226,6 +258,12 @@ Qwen LoRA：
 
 ```sh
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/action_policy_scifact_qwen25_3b_lora_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 512 --policy_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3"
+```
+
+联合 `action policy + stop policy`：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_qwen25_3b_lora_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3"
 ```
 
 ## 8. 当前结论
@@ -249,15 +287,18 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 - 当前 replay supervision 仍来自 weak policy
 - 当前结果证明的是接口和 imitation pipeline 稳定
 - 还不能把当前高分直接等价为最终 agent 能力
+- 当前 `Qwen action + Qwen stop` 联合 replay 与 action-only replay 基本一致，说明这套 SciFact weak replay 已接近饱和
+- 下一步更值得投入的是更大、更难、更多样的数据，而不是单纯在同一 weak replay 上继续加 epoch
 
 ## 9. 下一步建议
 
 建议按下面顺序继续推进：
 
 1. 保持 frozen verifier 不动
-2. 继续扩展 action policy replay 数据和评测切面
-3. 在 weakly-coupled 条件下加入更严格的 episode-level 诊断
-4. 等 action policy 在离线 replay 下足够稳定后，再考虑更正式的 agent loop
+2. 继续扩展 action policy / stop policy replay 数据和评测切面
+3. 在 weakly-coupled 条件下加入更严格的 episode-level 诊断与 joint replay 诊断
+4. 优先引入更大、更难的数据源，而不是继续在同一弱标签集上刷更多 epoch
+5. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
 
 当前不建议直接做：
 

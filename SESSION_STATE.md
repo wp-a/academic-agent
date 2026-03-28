@@ -2,8 +2,8 @@
 
 ## Current Scope
 
-This repository is currently focused on the **action policy** training loop only.
-Do not branch into stop policy, verifier, or RL until explicitly requested.
+This repository is currently focused on the **action policy + stop policy** training loop.
+Verifier remains frozen. Do not branch into joint verifier retraining or RL until explicitly requested.
 
 ## Repository
 
@@ -78,10 +78,48 @@ The action policy is now treated as a **classification task**, not JSON generati
   `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/trainers/common.py`
 - Inference script:
   `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/scripts/infer_action_policy.py`
+- Step-level eval script:
+  `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/scripts/eval_action_policy_predictions.py`
+  - now supports `prediction_rows` / `error_rows` export
+  - checkpoint directories can inherit `label_names.json` from the parent output dir
 - Helper to write one eval example to text:
   `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/scripts/write_first_eval_text.py`
 - One-shot smoke pipeline:
   `/public/localUsers/wangpengv2/AcademicSubmission/scripts/run_action_policy_smoke.sh`
+
+## Stop Policy Status
+
+### Current framing
+
+The stop policy is now treated as a **classification task** over the same verifier-driven `state_text`.
+
+- Input: `state_text`
+- Output: discrete `should_stop`
+- Labels currently used:
+  - `no`
+  - `yes`
+
+### Key files
+
+- SciFact stop replay exporter:
+  `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/scripts/export_scifact_stop_policy_data.py`
+- Trainer currently reused for stop classification:
+  `/public/localUsers/wangpengv2/AcademicSubmission/train_agent/trainers/train_action_policy.py`
+
+### Current data
+
+- output dir:
+  `/public/localUsers/wangpengv2/AcademicSubmission/data/processed/scifact_stop_policy_v1`
+- train examples: `2974`
+- validation examples: `1046`
+- class balance:
+  - train `no=2059`, `yes=915`
+  - validation `no=724`, `yes=322`
+
+### Current stop-policy output
+
+- output dir:
+  `/public/localUsers/wangpengv2/AcademicSubmission/outputs/stop_policy_scifact_qwen25_3b_lora_v1`
 
 ## Model / Outputs
 
@@ -128,6 +166,56 @@ Inference on one held-out state text predicted:
 - `predicted_label_id = 2`
 - `predicted_action_type = search`
 
+### Latest step-level eval result
+
+Real SciFact validation eval via `eval_action_policy_predictions` produced:
+- `num_examples = 1046`
+- `accuracy = 0.997132`
+- `macro_f1 = 0.997020`
+- `num_errors = 3`
+- error file:
+  `/public/localUsers/wangpengv2/AcademicSubmission/outputs/action_policy_scifact_bert_tiny_v1/step_eval_validation_errors.json`
+
+### Latest checkpoint comparison
+
+Direct eval now works for:
+- `outputs/action_policy_scifact_bert_tiny_v1/checkpoint-920`
+- `outputs/action_policy_scifact_bert_tiny_v1/checkpoint-930`
+
+Observed result:
+- `checkpoint-920`, `checkpoint-930`, and final output dir all matched on current step-level metrics
+- current residual errors are three `step_id=1` cases
+- two mistakes are `quote_evidence -> stop`
+- one mistake is `quote_evidence -> search`
+
+### Latest stop-policy train result
+
+Four-GPU `Qwen2.5-3B-Instruct + LoRA` stop training completed on SciFact stop replay.
+
+Final validation metrics:
+- `accuracy = 1.0`
+- `macro_f1 = 1.0`
+- confusion matrix:
+  - `[[724, 0], [0, 322]]`
+
+### Latest joint replay result
+
+Joint replay with:
+- `outputs/action_policy_scifact_qwen25_3b_lora_v1`
+- `outputs/stop_policy_scifact_qwen25_3b_lora_v1`
+- frozen verifier `v7_pairwise_margin + full_document`
+
+Produced:
+- `action_agreement = 1.0`
+- `success_rate = 0.973373`
+- `early_stop_rate = 0.0`
+- `suppressed_stop_count = 0`
+
+Interpretation:
+- joint replay matched the existing action-only Qwen replay on current SciFact weak labels
+- current bottleneck is no longer epoch count on this dataset
+- next leverage should come from larger and harder replay data, not more training passes over the same weak labels
+
 ## Public Dataset Status
 
 SciFact access works through proxy, but download command still needs correct config name.
@@ -139,12 +227,12 @@ It also requires `trust_remote_code=True`.
 
 ## Recommended Next Step After Restart
 
-Resume with **action policy only**.
+Resume with **action policy + stop policy**.
 Suggested next task:
-1. download SciFact `claims`
-2. inspect schema
-3. map it into `state_text -> action_type` or related action-policy supervision
-4. add eval accuracy script for current classifier outputs
+1. export larger and harder replay data beyond current SciFact weak labels
+2. prioritize multi-hop and longer-horizon supervision for `action policy` and `stop policy`
+3. keep the verifier frozen while scaling data and rerun joint replay
+4. only increase epochs after new data stops improving joint replay
 
 ## Reusable Commands
 
@@ -170,6 +258,30 @@ docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && /root/minico
 
 ```sh
 docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && /root/miniconda3/bin/conda run -n base python -m train_agent.scripts.infer_action_policy --model_dir outputs/action_policy_bert_tiny --state_text_file outputs/tmp/infer_eval_text.txt --max_length 256'
+```
+
+### Run step-level action-policy eval
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && /root/miniconda3/bin/conda run -n base python -m train_agent.scripts.eval_action_policy_predictions --model_dir outputs/action_policy_scifact_bert_tiny_v1 --eval_file data/processed/scifact_action_policy_v1/scifact_action_policy_validation.jsonl --output_path outputs/action_policy_scifact_bert_tiny_v1/step_eval_validation.json --errors_output_path outputs/action_policy_scifact_bert_tiny_v1/step_eval_validation_errors.json --max_length 256 --batch_size 32'
+```
+
+### Export SciFact stop-policy replay data
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.export_scifact_stop_policy_data --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_dir data/processed/scifact_stop_policy_v1 --max_steps 4 --doc_aggregation full_document --aggregation_top_k 3 --max_length 384 --batch_size 8 --trust_remote_code'
+```
+
+### Train stop policy on 4 GPUs
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0,1,2,3 && /root/miniconda3/bin/torchrun --nproc_per_node=4 -m train_agent.trainers.train_action_policy --train_file data/processed/scifact_stop_policy_v1/scifact_stop_policy_train.jsonl --eval_file data/processed/scifact_stop_policy_v1/scifact_stop_policy_validation.jsonl --model_name_or_path /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1 --output_dir outputs/stop_policy_scifact_qwen25_3b_lora_v1 --max_length 512 --num_train_epochs 1 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --gradient_accumulation_steps 8 --learning_rate 1e-4 --logging_steps 10 --eval_steps 50 --save_steps 50 --attn_implementation sdpa --use_lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --lora_target_modules q_proj,k_proj,v_proj,o_proj --lora_modules_to_save score --gradient_checkpointing'
+```
+
+### Run joint action+stop offline replay
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_qwen25_3b_lora_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3'
 ```
 
 ### Run full smoke pipeline
