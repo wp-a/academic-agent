@@ -1,0 +1,71 @@
+{
+  "task": "decomposed_verifier",
+  "stages": {
+    "relevance": {
+      "labels": [
+        "NEUTRAL",
+        "RELEVANT"
+      ],
+      "hard_negatives_per_positive": 2,
+      "random_negatives_per_positive": 1
+    },
+    "stance": {
+      "labels": [
+        "CONTRADICT",
+        "SUPPORT"
+      ],
+      "train_on_relevant_only": true
+    }
+  },
+  "splits": {
+    "train": {
+      "relevance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_relevance_train.jsonl",
+        "num_examples": 4962,
+        "label_counts": {
+          "NEUTRAL": 3937,
+          "RELEVANT": 1025
+        }
+      },
+      "stance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_stance_train.jsonl",
+        "num_examples": 1025,
+        "label_counts": {
+          "CONTRADICT": 364,
+          "SUPPORT": 661
+        }
+      }
+    },
+    "validation": {
+      "relevance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_relevance_validation.jsonl",
+        "num_examples": 1781,
+        "label_counts": {
+          "NEUTRAL": 1415,
+          "RELEVANT": 366
+        }
+      },
+      "stance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_stance_validation.jsonl",
+        "num_examples": 366,
+        "label_counts": {
+          "CONTRADICT": 131,
+          "SUPPORT": 235
+        }
+      }
+    },
+    "test": {
+      "relevance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_relevance_test.jsonl",
+        "num_examples": 0,
+        "label_counts": {}
+      },
+      "stance": {
+        "output_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_stance_test.jsonl",
+        "num_examples": 0,
+        "label_counts": {}
+      }
+    }
+  },
+  "stats_path": "data/processed/scifact_decomposed_verifier_relevance_hardneg_v1/scifact_decomposed_verifier_stats.json"
+}

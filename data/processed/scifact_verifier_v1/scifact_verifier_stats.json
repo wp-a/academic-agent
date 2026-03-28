@@ -1,0 +1,35 @@
+{
+  "task": "verifier_relevance_and_stance",
+  "labels": [
+    "CONTRADICT",
+    "NEUTRAL",
+    "SUPPORT"
+  ],
+  "sufficiency_target": false,
+  "splits": {
+    "train": {
+      "output_path": "data/processed/scifact_verifier_v1/scifact_verifier_train.jsonl",
+      "num_examples": 15817,
+      "label_counts": {
+        "CONTRADICT": 364,
+        "NEUTRAL": 14792,
+        "SUPPORT": 661
+      }
+    },
+    "validation": {
+      "output_path": "data/processed/scifact_verifier_v1/scifact_verifier_validation.jsonl",
+      "num_examples": 6143,
+      "label_counts": {
+        "CONTRADICT": 131,
+        "NEUTRAL": 5777,
+        "SUPPORT": 235
+      }
+    },
+    "test": {
+      "output_path": "data/processed/scifact_verifier_v1/scifact_verifier_test.jsonl",
+      "num_examples": 0,
+      "label_counts": {}
+    }
+  },
+  "stats_path": "data/processed/scifact_verifier_v1/scifact_verifier_stats.json"
+}
