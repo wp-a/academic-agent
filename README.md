@@ -23,6 +23,13 @@
 - 不进入 online rollout / RL 主循环
 - 不在当前阶段混 FEVER/HoVer 联训到主线上
 
+## 0. 导航
+
+- 公开仓库首页说明：本文档
+- 复现实验说明：`docs/reproduce.md`
+- 训练设计文档：`docs/plans/2026-03-27-agent-training-design.md`
+- 训练实施文档：`docs/plans/2026-03-27-agent-training.md`
+
 ## 1. 当前项目目标
 
 目标是构建一个在受限证据环境中真正有用的 evidence-seeking agent，而不是只做一个教学版的最小分类器。
