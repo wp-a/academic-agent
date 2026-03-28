@@ -23,6 +23,7 @@ class RestrictedRetrievalEpisode:
     doc_pool: List[str]
     gold_evidence: List[RestrictedEvidence]
     document_contents: Dict[str, str] = field(default_factory=dict)
+    document_sentences: Dict[str, List[str]] = field(default_factory=dict)
     max_steps: int = 4
 
 
@@ -31,6 +32,7 @@ class RestrictedRetrievalState:
     claim: str
     doc_pool: List[str]
     document_contents: Dict[str, str] = field(default_factory=dict)
+    document_sentences: Dict[str, List[str]] = field(default_factory=dict)
     revealed_docs: List[str] = field(default_factory=list)
     revealed_evidence: List[RestrictedEvidence] = field(default_factory=list)
     quoted_evidence: List[RestrictedEvidence] = field(default_factory=list)
@@ -79,6 +81,16 @@ class FrozenVerifierProtocol:
     def score_documents(self, claim: str, documents: Dict[str, str]) -> Dict[str, float]:
         raise NotImplementedError
 
+    def score_document_sentences(
+        self,
+        claim: str,
+        documents: Dict[str, List[str]],
+        *,
+        aggregation: str = "max",
+        aggregation_top_k: int = 3,
+    ) -> Dict[str, float]:
+        raise NotImplementedError
+
 
 def build_scifact_episode(row: Dict[str, object], max_steps: int = 4) -> RestrictedRetrievalEpisode:
     cited_doc_ids = [str(doc_id) for doc_id in row.get("cited_doc_ids", [])]
@@ -88,6 +100,7 @@ def build_scifact_episode(row: Dict[str, object], max_steps: int = 4) -> Restric
     label_hint = evidence_label if evidence_label else "UNKNOWN"
 
     document_contents = {}
+    document_sentences = {}
     if isinstance(row.get("documents"), list):
         for item in row["documents"]:
             if not isinstance(item, dict):
@@ -95,7 +108,9 @@ def build_scifact_episode(row: Dict[str, object], max_steps: int = 4) -> Restric
             doc_id = str(item.get("doc_id") or "")
             if not doc_id:
                 continue
-            document_contents[doc_id] = " ".join(str(sentence) for sentence in item.get("sentences", []))
+            sentences = [str(sentence) for sentence in item.get("sentences", [])]
+            document_sentences[doc_id] = sentences
+            document_contents[doc_id] = " ".join(sentences)
 
     doc_pool = cited_doc_ids.copy()
     if evidence_doc_id and evidence_doc_id not in doc_pool:
@@ -121,14 +136,24 @@ def build_scifact_episode(row: Dict[str, object], max_steps: int = 4) -> Restric
         doc_pool=doc_pool,
         gold_evidence=gold_evidence,
         document_contents=document_contents,
+        document_sentences=document_sentences,
         max_steps=max_steps,
     )
 
 
 class RestrictedRetrievalEnv:
-    def __init__(self, episode: RestrictedRetrievalEpisode, frozen_verifier: Optional[FrozenVerifierProtocol] = None):
+    def __init__(
+        self,
+        episode: RestrictedRetrievalEpisode,
+        frozen_verifier: Optional[FrozenVerifierProtocol] = None,
+        *,
+        doc_aggregation: str = "full_document",
+        aggregation_top_k: int = 3,
+    ):
         self.episode = episode
         self.frozen_verifier = frozen_verifier
+        self.doc_aggregation = doc_aggregation
+        self.aggregation_top_k = max(1, aggregation_top_k)
         self._gold_by_doc = {item.doc_id: item for item in episode.gold_evidence}
         self._state: RestrictedRetrievalState | None = None
         self._done = False
@@ -139,6 +164,7 @@ class RestrictedRetrievalEnv:
             claim=self.episode.claim,
             doc_pool=self.episode.doc_pool.copy(),
             document_contents=self.episode.document_contents.copy(),
+            document_sentences={doc_id: list(sentences) for doc_id, sentences in self.episode.document_sentences.items()},
             step_index=0,
             max_steps=self.episode.max_steps,
         )
@@ -187,12 +213,27 @@ class RestrictedRetrievalEnv:
             return unrevealed_docs, {}
         if self.frozen_verifier is None:
             return unrevealed_docs, {}
-        documents = {doc_id: state.document_contents.get(doc_id, "") for doc_id in unrevealed_docs}
-        scores = {
-            doc_id: float(score)
-            for doc_id, score in self.frozen_verifier.score_documents(state.claim, documents).items()
-            if doc_id in documents
-        }
+
+        if self.doc_aggregation != "full_document" and state.document_sentences:
+            documents = {doc_id: list(state.document_sentences.get(doc_id, [])) for doc_id in unrevealed_docs}
+            scores = {
+                doc_id: float(score)
+                for doc_id, score in self.frozen_verifier.score_document_sentences(
+                    state.claim,
+                    documents,
+                    aggregation=self.doc_aggregation,
+                    aggregation_top_k=self.aggregation_top_k,
+                ).items()
+                if doc_id in documents
+            }
+        else:
+            documents = {doc_id: state.document_contents.get(doc_id, "") for doc_id in unrevealed_docs}
+            scores = {
+                doc_id: float(score)
+                for doc_id, score in self.frozen_verifier.score_documents(state.claim, documents).items()
+                if doc_id in documents
+            }
+
         for doc_id in unrevealed_docs:
             scores.setdefault(doc_id, 0.0)
         state.verifier_scores.update(scores)

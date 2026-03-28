@@ -1,44 +1,263 @@
-# AcademicSubmission
+# Academic Agent
 
-Minimal evidence-seeking agent scaffold for `deep_research_review_v2`.
+面向 `deep_research_review_v2` 的可训练 evidence-seeking agent 原型仓库。
 
-Current scope:
+当前仓库已经不再停留在最早的 demo scaffold，而是围绕“受限证据环境中的模块化 agent”推进。当前重点不是直接训练一个完整 reviewer agent，而是先把下面几条可单独验证的链路做稳：
 
-- trajectory recording in JSONL
-- supervised data export for `next_action` and `stopping`
-- LoRA SFT training script compatible with single-node 4x V100, fp16, DDP via `torchrun`
+- `verifier`：在受限文档集合内对证据相关性和立场进行判别与排序
+- `action policy`：在 frozen verifier 提供的状态下，学习 `search / quote_evidence / stop`
+- `restricted env`：用于离线 replay、ranking 评测和后续更正式主循环接入
 
-The project intentionally starts small so the agent loop can be trained before adding online RL or heavier verifier stacks.
+当前已经完成：
 
-## Layout
+- SciFact `decomposed verifier` 路线
+- frozen verifier 下的 restricted ranking 评测
+- weakly-coupled action policy 数据导出
+- action policy 小分类 baseline
+- `Qwen2.5-3B-Instruct` LoRA action policy 主线
+- action-level 与 episode-level offline replay 评测
 
-- `deep_research_review_v2/trajectory.py`: trajectory schema and recorder
-- `deep_research_review_v2/export_sft_data.py`: export trajectories to SFT JSONL
-- `deep_research_review_v2/train_sft.py`: LoRA SFT entrypoint
-- `scripts/create_demo_trajectories.py`: generate demo data
+当前明确不做：
 
-## Container commands
+- 不直接训练完整 reviewer head
+- 不进入 online rollout / RL 主循环
+- 不在当前阶段混 FEVER/HoVer 联训到主线上
 
-Generate demo trajectories:
+## 1. 当前项目目标
+
+目标是构建一个在受限证据环境中真正有用的 evidence-seeking agent，而不是只做一个教学版的最小分类器。
+
+当前的工程策略是：
+
+1. 先冻结一个足够稳定的 verifier
+2. 基于 frozen verifier 导出 action policy replay 数据
+3. 先做 offline imitation / replay 验证
+4. 等 action policy 与 restricted env 的接口跑稳，再讨论更正式的 agent loop
+
+## 2. 当前主线状态
+
+### 2.1 Verifier 主线
+
+当前冻结的 relevance baseline 是：
+
+- `v7_pairwise_margin + full_document`
+
+它是当前 frozen verifier 的主线基线，用于：
+
+- restricted env 文档揭示顺序
+- SciFact weakly-coupled action replay 导出
+- offline replay 环境中的 verifier side signal
+
+当前 stance 头保持为 decomposed verifier 结构的一部分，但本阶段不继续扩展它。
+
+### 2.2 Action Policy 主线
+
+当前 action policy 是一个三分类任务：
+
+- `search`
+- `quote_evidence`
+- `stop`
+
+输入是 verifier 驱动环境状态的 `state_text`，输出是离散 `action_type`。
+
+当前已经跑通两条线：
+
+- 小分类 baseline：`prajjwal1/bert-tiny`
+- 主力 baseline：`Qwen2.5-3B-Instruct` + LoRA
+
+### 2.3 评测方式
+
+当前 action policy 不是看生成文本，而是看两层指标：
+
+1. step-level classification
+   - `accuracy`
+   - `macro_f1`
+   - per-action `precision / recall / f1`
+   - confusion matrix
+2. episode-level offline replay
+   - `action_agreement`
+   - `average_steps`
+   - `stop_precision / stop_recall`
+   - `quote_evidence_hit_rate`
+   - `success_rate`
+   - `early_stop_rate`
+
+## 3. 目录结构
+
+### 3.1 训练与数据
+
+- `train_agent/data/`
+  - 数据 schema 与数据适配逻辑
+- `train_agent/trajectories/`
+  - trajectory schema 与历史导出逻辑
+- `train_agent/models/`
+  - frozen verifier / frozen action policy 推理封装
+- `train_agent/trainers/`
+  - `train_verifier.py`
+  - `train_action_policy.py`
+- `train_agent/eval/`
+  - verifier metrics
+  - restricted ranking
+  - action policy metrics
+- `train_agent/scripts/`
+  - SciFact verifier 数据导出
+  - action policy replay 数据导出
+  - offline replay 评测
+  - inference / utility 脚本
+- `train_agent/rl/`
+  - restricted retrieval environment
+
+### 3.2 文档
+
+- `docs/plans/2026-03-27-agent-training-design.md`
+- `docs/plans/2026-03-27-agent-training.md`
+- `docs/plans/2026-03-27-restricted-retrieval-rl-environment.md`
+- `SESSION_STATE.md`
+
+## 4. 环境约束
+
+当前默认环境：
+
+- 宿主机路径：`/public/localUsers/wangpengv2/AcademicSubmission`
+- 容器路径：`/mnt/AcademicSubmission`
+- 容器：`2e230dfba7c5`
+- 训练方式：单机 `4 x V100-SXM2-32GB`
+- 精度：`fp16`
+- 分布式：`torchrun` / DDP
+
+当前明确约束：
+
+- 不使用 `bf16`
+- 不使用 `flash-attn2`
+- 不使用 `deepspeed`
+
+所有 Python / 数据处理 / 训练 / 评测命令都应通过容器执行：
 
 ```sh
-docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && /root/miniconda3/bin/conda run -n base python -m scripts.create_demo_trajectories --output data/demo_trajectories.jsonl'
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && ..."
 ```
 
-Export SFT data:
+## 5. 代理与 Hugging Face 访问
+
+容器内访问外网时，需要显式透传代理：
 
 ```sh
-docker exec -i 2e230dfba7c5 bash -lc 'cd /mnt/AcademicSubmission && /root/miniconda3/bin/conda run -n base python -m deep_research_review_v2.export_sft_data --input data/demo_trajectories.jsonl --output_dir data/exports'
+export HTTP_PROXY=http://172.17.0.1:17898
+export HTTPS_PROXY=http://172.17.0.1:17898
+export NO_PROXY=localhost,127.0.0.1
 ```
 
-Train next-action policy:
+对于大模型下载，建议先单进程预拉取 snapshot，再启动 `torchrun`，避免多卡 rank 重复下载导致超时。
+
+## 6. 当前已验证的数据与产物
+
+### 6.1 SciFact action-policy replay 数据
+
+当前 replay 数据目录：
+
+- `data/processed/scifact_action_policy_v1/`
+
+当前导出设置：
+
+- frozen verifier：`outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin`
+- doc aggregation：`full_document`
+- max steps：`4`
+
+当前数据规模：
+
+- train：`957` episodes，`2974` action examples
+- validation：`338` episodes，`1046` action examples
+
+### 6.2 Action policy 模型输出
+
+小分类 baseline：
+
+- `outputs/action_policy_scifact_bert_tiny_v1`
+
+Qwen LoRA 主线：
+
+- `outputs/action_policy_scifact_qwen25_3b_lora_v1`
+
+## 7. 关键命令
+
+### 7.1 导出 SciFact action-policy replay 数据
 
 ```sh
-docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/bin/conda run -n base torchrun --nproc_per_node=4 -m deep_research_review_v2.train_sft --task next_action --train_file data/exports/next_action_train.jsonl --eval_file data/exports/next_action_eval.jsonl --model_name_or_path meta-llama/Llama-3.2-1B --output_dir outputs/next_action_lora --fp16"
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.export_scifact_action_policy_data --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_dir data/processed/scifact_action_policy_v1 --max_steps 4 --doc_aggregation full_document --aggregation_top_k 3 --max_length 384 --batch_size 8"
 ```
 
-Train stopping policy:
+### 7.2 训练小分类 baseline
 
 ```sh
-docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && CUDA_VISIBLE_DEVICES=0,1,2,3 /root/miniconda3/bin/conda run -n base torchrun --nproc_per_node=4 -m deep_research_review_v2.train_sft --task stopping --train_file data/exports/stopping_train.jsonl --eval_file data/exports/stopping_eval.jsonl --model_name_or_path meta-llama/Llama-3.2-1B --output_dir outputs/stopping_lora --fp16"
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.trainers.train_action_policy --train_file data/processed/scifact_action_policy_v1/scifact_action_policy_train.jsonl --eval_file data/processed/scifact_action_policy_v1/scifact_action_policy_validation.jsonl --model_name_or_path prajjwal1/bert-tiny --output_dir outputs/action_policy_scifact_bert_tiny_v1 --max_length 256 --num_train_epochs 5 --per_device_train_batch_size 16 --per_device_eval_batch_size 32 --learning_rate 2e-4 --logging_steps 20 --eval_steps 40 --save_steps 40 --gradient_accumulation_steps 1 --attn_implementation sdpa"
 ```
+
+### 7.3 预下载 Qwen2.5-3B-Instruct
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export HF_HUB_DOWNLOAD_TIMEOUT=120 && export HF_HUB_ETAG_TIMEOUT=120 && /root/miniconda3/bin/python - <<\"PY\"
+from huggingface_hub import snapshot_download
+print(snapshot_download(repo_id=\"Qwen/Qwen2.5-3B-Instruct\", max_workers=1, allow_patterns=[\"*.json\", \"*.safetensors\", \"tokenizer*\", \"merges.txt\", \"vocab.json\", \"*.model\", \"*.py\"]))
+PY"
+```
+
+### 7.4 训练 Qwen2.5-3B-Instruct LoRA action policy
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0,1,2,3 && /root/miniconda3/bin/torchrun --nproc_per_node=4 -m train_agent.trainers.train_action_policy --train_file data/processed/scifact_action_policy_v1/scifact_action_policy_train.jsonl --eval_file data/processed/scifact_action_policy_v1/scifact_action_policy_validation.jsonl --model_name_or_path /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1 --output_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --max_length 512 --num_train_epochs 1 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --gradient_accumulation_steps 8 --learning_rate 1e-4 --logging_steps 10 --eval_steps 50 --save_steps 50 --attn_implementation sdpa --use_lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --lora_target_modules q_proj,k_proj,v_proj,o_proj --lora_modules_to_save score --gradient_checkpointing"
+```
+
+### 7.5 运行 action policy offline replay 评测
+
+小模型：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_bert_tiny_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/action_policy_scifact_bert_tiny_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 256 --policy_batch_size 32 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3"
+```
+
+Qwen LoRA：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/action_policy_scifact_qwen25_3b_lora_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 512 --policy_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3"
+```
+
+## 8. 当前结论
+
+### 8.1 关于 verifier
+
+- relevance 主线冻结在 `v7_pairwise_margin + full_document`
+- 当前不继续做 verifier loss 试验
+
+### 8.2 关于 action policy
+
+当前已经具备开始更正式 action policy 主线实验的工程条件：
+
+- frozen verifier 接口稳定
+- replay 数据可稳定导出
+- 小模型与 3B LoRA 模型都能完成 step-level 训练
+- offline replay 评测链路已打通
+
+但需要明确：
+
+- 当前 replay supervision 仍来自 weak policy
+- 当前结果证明的是接口和 imitation pipeline 稳定
+- 还不能把当前高分直接等价为最终 agent 能力
+
+## 9. 下一步建议
+
+建议按下面顺序继续推进：
+
+1. 保持 frozen verifier 不动
+2. 继续扩展 action policy replay 数据和评测切面
+3. 在 weakly-coupled 条件下加入更严格的 episode-level 诊断
+4. 等 action policy 在离线 replay 下足够稳定后，再考虑更正式的 agent loop
+
+当前不建议直接做：
+
+- online RL
+- rollout 主循环
+- verifier / action policy 同时联动重训
+
+## 10. 备注
+
+仓库里已有一些历史脚本和早期最小骨架；当前更可信的运行入口以 `train_agent/` 目录、`docs/plans/` 文档和本 README 为准。

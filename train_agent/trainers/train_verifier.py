@@ -15,7 +15,7 @@ from train_agent.eval.verifier_metrics import compute_verifier_metrics
 from train_agent.models.verifier import build_pretrained_verifier, build_smoke_verifier
 from train_agent.trainers.common import set_runtime_env
 
-MODEL_INPUT_KEYS = ('input_ids', 'attention_mask', 'token_type_ids')
+MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "token_type_ids")
 
 
 class WeightedLossTrainer(Trainer):
@@ -42,7 +42,7 @@ class WeightedSamplingTrainer(Trainer):
         if self.sample_weights is None:
             return super()._get_train_sampler()
         if self.args.world_size > 1:
-            raise ValueError('class_balance=sampler currently supports single-process training only')
+            raise ValueError("class_balance=sampler currently supports single-process training only")
         return WeightedRandomSampler(
             weights=torch.tensor(self.sample_weights, dtype=torch.double),
             num_samples=len(self.sample_weights),
@@ -58,6 +58,8 @@ class PairwiseRankingTrainer(Trainer):
         eval_data_collator,
         positive_label_indices: Sequence[int],
         negative_label_indices: Sequence[int],
+        pairwise_loss: str = "softplus",
+        pairwise_margin: float = 0.5,
         **kwargs,
     ):
         self.train_data_collator = train_data_collator
@@ -65,6 +67,8 @@ class PairwiseRankingTrainer(Trainer):
         super().__init__(*args, data_collator=train_data_collator, **kwargs)
         self.positive_label_indices = [int(index) for index in positive_label_indices]
         self.negative_label_indices = [int(index) for index in negative_label_indices]
+        self.pairwise_loss = str(pairwise_loss)
+        self.pairwise_margin = float(pairwise_margin)
 
     def _with_data_collator(self, collator, loader_fn, *args, **kwargs):
         previous_collator = self.data_collator
@@ -85,20 +89,149 @@ class PairwiseRankingTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         del num_items_in_batch
-        if 'positive_input_ids' in inputs:
-            positive_outputs = model(**select_model_inputs(inputs, prefix='positive_'))
-            negative_outputs = model(**select_model_inputs(inputs, prefix='negative_'))
+        if "positive_input_ids" in inputs:
+            positive_outputs = model(**select_model_inputs(inputs, prefix="positive_"))
+            negative_outputs = model(**select_model_inputs(inputs, prefix="negative_"))
             loss = compute_pairwise_ranking_loss(
-                positive_logits=positive_outputs.get('logits'),
-                negative_logits=negative_outputs.get('logits'),
+                positive_logits=positive_outputs.get("logits"),
+                negative_logits=negative_outputs.get("logits"),
                 positive_label_indices=self.positive_label_indices,
                 negative_label_indices=self.negative_label_indices,
+                loss_type=self.pairwise_loss,
+                margin=self.pairwise_margin,
             )
             if return_outputs:
                 return loss, {
-                    'positive_logits': positive_outputs.get('logits'),
-                    'negative_logits': negative_outputs.get('logits'),
+                    "positive_logits": positive_outputs.get("logits"),
+                    "negative_logits": negative_outputs.get("logits"),
                 }
+            return loss
+
+        loss, outputs = compute_classification_loss(model, inputs)
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+
+class InBatchDocumentRankingTrainer(Trainer):
+    def __init__(
+        self,
+        *args,
+        train_data_collator,
+        eval_data_collator,
+        positive_label_indices: Sequence[int],
+        negative_label_indices: Sequence[int],
+        inbatch_temperature: float = 1.0,
+        **kwargs,
+    ):
+        self.train_data_collator = train_data_collator
+        self.eval_data_collator = eval_data_collator
+        super().__init__(*args, data_collator=train_data_collator, **kwargs)
+        self.positive_label_indices = [int(index) for index in positive_label_indices]
+        self.negative_label_indices = [int(index) for index in negative_label_indices]
+        self.inbatch_temperature = float(inbatch_temperature)
+
+    def _with_data_collator(self, collator, loader_fn, *args, **kwargs):
+        previous_collator = self.data_collator
+        self.data_collator = collator
+        try:
+            return loader_fn(*args, **kwargs)
+        finally:
+            self.data_collator = previous_collator
+
+    def get_train_dataloader(self):
+        return self._with_data_collator(self.train_data_collator, super().get_train_dataloader)
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        return self._with_data_collator(self.eval_data_collator, super().get_eval_dataloader, eval_dataset)
+
+    def get_test_dataloader(self, test_dataset):
+        return self._with_data_collator(self.eval_data_collator, super().get_test_dataloader, test_dataset)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        del num_items_in_batch
+        if "positive_mask" in inputs:
+            positive_mask = inputs["positive_mask"].to(model.device)
+            outputs = model(**select_model_inputs(inputs))
+            logits = outputs.get("logits")
+            batch_size = int(positive_mask.shape[0])
+            loss = compute_inbatch_document_ranking_loss(
+                logits=logits.view(batch_size, batch_size, -1),
+                positive_mask=positive_mask,
+                positive_label_indices=self.positive_label_indices,
+                negative_label_indices=self.negative_label_indices,
+                temperature=self.inbatch_temperature,
+            )
+            if return_outputs:
+                return loss, {"logits": logits}
+            return loss
+
+        loss, outputs = compute_classification_loss(model, inputs)
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+
+class DocumentListwiseRankingTrainer(Trainer):
+    def __init__(
+        self,
+        *args,
+        train_data_collator,
+        eval_data_collator,
+        positive_label_indices: Sequence[int],
+        negative_label_indices: Sequence[int],
+        listwise_top_k: int = 3,
+        listwise_margin: float = 0.1,
+        listwise_margin_weight: float = 1.0,
+        **kwargs,
+    ):
+        self.train_data_collator = train_data_collator
+        self.eval_data_collator = eval_data_collator
+        super().__init__(*args, data_collator=train_data_collator, **kwargs)
+        self.positive_label_indices = [int(index) for index in positive_label_indices]
+        self.negative_label_indices = [int(index) for index in negative_label_indices]
+        self.listwise_top_k = int(listwise_top_k)
+        self.listwise_margin = float(listwise_margin)
+        self.listwise_margin_weight = float(listwise_margin_weight)
+
+    def _with_data_collator(self, collator, loader_fn, *args, **kwargs):
+        previous_collator = self.data_collator
+        self.data_collator = collator
+        try:
+            return loader_fn(*args, **kwargs)
+        finally:
+            self.data_collator = previous_collator
+
+    def get_train_dataloader(self):
+        return self._with_data_collator(self.train_data_collator, super().get_train_dataloader)
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        return self._with_data_collator(self.eval_data_collator, super().get_eval_dataloader, eval_dataset)
+
+    def get_test_dataloader(self, test_dataset):
+        return self._with_data_collator(self.eval_data_collator, super().get_test_dataloader, test_dataset)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        del num_items_in_batch
+        if "group_sizes" in inputs:
+            positive_mask = inputs["positive_mask"].to(model.device)
+            doc_mask = inputs["doc_mask"].to(model.device)
+            group_sizes = inputs["group_sizes"]
+            outputs = model(**select_model_inputs(inputs))
+            logits = outputs.get("logits")
+            loss = compute_document_listwise_ranking_loss(
+                logits=logits,
+                positive_mask=positive_mask,
+                doc_mask=doc_mask,
+                group_sizes=group_sizes,
+                positive_label_indices=self.positive_label_indices,
+                negative_label_indices=self.negative_label_indices,
+                top_k=self.listwise_top_k,
+                margin=self.listwise_margin,
+                margin_weight=self.listwise_margin_weight,
+            )
+            if return_outputs:
+                return loss, {"logits": logits}
             return loss
 
         loss, outputs = compute_classification_loss(model, inputs)
@@ -118,60 +251,137 @@ class PairwiseDataCollator:
         lengths = []
         for feature in features:
             positive_feature = {
-                key[len('positive_'):]: value
+                key[len("positive_"):]: value
                 for key, value in feature.items()
-                if key.startswith('positive_') and key[len('positive_'):] in MODEL_INPUT_KEYS
+                if key.startswith("positive_") and key[len("positive_"):] in MODEL_INPUT_KEYS
             }
             negative_feature = {
-                key[len('negative_'):]: value
+                key[len("negative_"):]: value
                 for key, value in feature.items()
-                if key.startswith('negative_') and key[len('negative_'):] in MODEL_INPUT_KEYS
+                if key.startswith("negative_") and key[len("negative_"):] in MODEL_INPUT_KEYS
             }
             positive_features.append(positive_feature)
             negative_features.append(negative_feature)
-            lengths.append(int(feature.get('length', 0)))
+            lengths.append(int(feature.get("length", 0)))
 
         positive_batch = self.tokenizer.pad(
             positive_features,
             padding=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors='pt',
+            return_tensors="pt",
         )
         negative_batch = self.tokenizer.pad(
             negative_features,
             padding=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors='pt',
+            return_tensors="pt",
         )
-        batch = {f'positive_{key}': value for key, value in positive_batch.items()}
-        batch.update({f'negative_{key}': value for key, value in negative_batch.items()})
-        batch['length'] = torch.tensor(lengths, dtype=torch.long)
+        batch = {f"positive_{key}": value for key, value in positive_batch.items()}
+        batch.update({f"negative_{key}": value for key, value in negative_batch.items()})
+        batch["length"] = torch.tensor(lengths, dtype=torch.long)
         return batch
+
+
+class DocumentListwiseDataCollator:
+    def __init__(self, tokenizer, max_length: int, pad_to_multiple_of: int = 8):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features):
+        flat_claims: List[str] = []
+        flat_documents: List[str] = []
+        group_sizes: List[int] = []
+        lengths: List[int] = []
+        max_docs = max((len(feature["documents"]) for feature in features), default=1)
+        positive_rows: List[List[bool]] = []
+        doc_rows: List[List[bool]] = []
+        for feature in features:
+            documents = list(feature["documents"])
+            group_sizes.append(len(documents))
+            lengths.append(int(feature.get("length", 0)))
+            positive_row = [False] * max_docs
+            doc_row = [False] * max_docs
+            for doc_index, document in enumerate(documents):
+                flat_claims.append(str(feature["claim"]))
+                flat_documents.append(str(document["text"]))
+                positive_row[doc_index] = bool(document["is_positive"])
+                doc_row[doc_index] = True
+            positive_rows.append(positive_row)
+            doc_rows.append(doc_row)
+
+        encoded = self.tokenizer(
+            flat_claims,
+            flat_documents,
+            truncation=True,
+            max_length=self.max_length,
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+        encoded["positive_mask"] = torch.tensor(positive_rows, dtype=torch.bool)
+        encoded["doc_mask"] = torch.tensor(doc_rows, dtype=torch.bool)
+        encoded["group_sizes"] = torch.tensor(group_sizes, dtype=torch.long)
+        encoded["length"] = torch.tensor(lengths, dtype=torch.long)
+        return encoded
+
+
+class InBatchDocumentDataCollator:
+    def __init__(self, tokenizer, max_length: int, pad_to_multiple_of: int = 8):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features):
+        claims = [str(feature["claim"]) for feature in features]
+        documents = [str(feature["document_text"]) for feature in features]
+        group_ids = [str(feature["group_id"]) for feature in features]
+        cross_claims: List[str] = []
+        cross_documents: List[str] = []
+        for claim in claims:
+            cross_claims.extend([claim] * len(documents))
+            cross_documents.extend(documents)
+        encoded = self.tokenizer(
+            cross_claims,
+            cross_documents,
+            truncation=True,
+            max_length=self.max_length,
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+        positive_mask = torch.tensor(
+            [[anchor_group == doc_group for doc_group in group_ids] for anchor_group in group_ids],
+            dtype=torch.bool,
+        )
+        encoded["positive_mask"] = positive_mask
+        encoded["length"] = torch.tensor([int(feature.get("length", 0)) for feature in features], dtype=torch.long)
+        return encoded
 
 
 def read_verifier_labels(path: Path):
     labels = set()
-    with path.open('r', encoding='utf-8') as handle:
+    with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             row = json.loads(line)
-            labels.add(row['label'])
+            labels.add(row["label"])
     return sorted(labels)
 
 
 def verifier_features(label_names):
     return Features(
         {
-            'example_id': Value('string'),
-            'sample_id': Value('string'),
-            'dataset': Value('string'),
-            'group_id': Value('string'),
-            'claim': Value('string'),
-            'evidence_text': Value('string'),
-            'doc_id': Value('string'),
-            'sentence_id': Value('int64'),
-            'label': ClassLabel(names=label_names),
+            "example_id": Value("string"),
+            "sample_id": Value("string"),
+            "dataset": Value("string"),
+            "group_id": Value("string"),
+            "claim": Value("string"),
+            "evidence_text": Value("string"),
+            "doc_id": Value("string"),
+            "sentence_id": Value("int64"),
+            "label": ClassLabel(names=label_names),
         }
     )
 
@@ -179,22 +389,22 @@ def verifier_features(label_names):
 def load_verifier_datasets(train_file: Path, eval_file: Path):
     label_names = sorted(set(read_verifier_labels(train_file) + read_verifier_labels(eval_file)))
     features = verifier_features(label_names)
-    train_dataset = load_dataset('json', data_files=str(train_file), split='train', features=features)
-    eval_dataset = load_dataset('json', data_files=str(eval_file), split='train', features=features)
+    train_dataset = load_dataset("json", data_files=str(train_file), split="train", features=features)
+    eval_dataset = load_dataset("json", data_files=str(eval_file), split="train", features=features)
     return train_dataset, eval_dataset, label_names
 
 
 def tokenize_verifier_dataset(dataset, tokenizer, max_length: int):
     def _tokenize(batch):
         encoded = tokenizer(
-            batch['claim'],
-            batch['evidence_text'],
+            batch["claim"],
+            batch["evidence_text"],
             truncation=True,
             max_length=max_length,
             padding=False,
         )
-        encoded['labels'] = batch['label']
-        encoded['length'] = [len(input_ids) for input_ids in encoded['input_ids']]
+        encoded["labels"] = batch["label"]
+        encoded["length"] = [len(input_ids) for input_ids in encoded["input_ids"]]
         return encoded
 
     return dataset.map(_tokenize, batched=True, remove_columns=dataset.column_names)
@@ -208,25 +418,31 @@ def resolve_positive_negative_label_indices(label_names: Sequence[str]) -> Tuple
     return positive_indices, negative_indices
 
 
-def _build_document_pairwise_examples(dataset, positive_label_indices: Sequence[int]):
+def _group_documents(dataset, positive_label_indices: Sequence[int]) -> Dict[str, Dict[str, Dict[str, object]]]:
     grouped_documents: Dict[str, Dict[str, Dict[str, object]]] = {}
     for row in dataset:
-        group_id = str(row['group_id'])
-        doc_id = str(row['doc_id'])
+        group_id = str(row["group_id"])
+        doc_id = str(row["doc_id"])
         documents = grouped_documents.setdefault(group_id, {})
         document = documents.setdefault(
             doc_id,
             {
-                'claim': str(row['claim']),
-                'doc_id': doc_id,
-                'sentences': {},
-                'is_positive': False,
+                "claim": str(row["claim"]),
+                "dataset": str(row["dataset"]),
+                "sample_id": str(row["sample_id"]),
+                "doc_id": doc_id,
+                "sentences": {},
+                "is_positive": False,
             },
         )
-        document['sentences'][int(row['sentence_id'])] = str(row['evidence_text'])
-        if int(row['label']) in positive_label_indices:
-            document['is_positive'] = True
+        document["sentences"][int(row["sentence_id"])] = str(row["evidence_text"])
+        if int(row["label"]) in positive_label_indices:
+            document["is_positive"] = True
+    return grouped_documents
 
+
+def _build_document_pairwise_examples(dataset, positive_label_indices: Sequence[int]):
+    grouped_documents = _group_documents(dataset, positive_label_indices)
     pair_examples = []
     positive_docs = 0
     negative_docs = 0
@@ -235,21 +451,18 @@ def _build_document_pairwise_examples(dataset, positive_label_indices: Sequence[
         aggregated_documents = []
         for doc_id in sorted(grouped_documents[group_id]):
             document = grouped_documents[group_id][doc_id]
-            ordered_sentences = [
-                document['sentences'][sentence_id]
-                for sentence_id in sorted(document['sentences'])
-            ]
+            ordered_sentences = [document["sentences"][sentence_id] for sentence_id in sorted(document["sentences"])]
             aggregated_documents.append(
                 {
-                    'group_id': group_id,
-                    'claim': document['claim'],
-                    'doc_id': doc_id,
-                    'text': '\n'.join(ordered_sentences),
-                    'is_positive': bool(document['is_positive']),
+                    "group_id": group_id,
+                    "claim": document["claim"],
+                    "doc_id": doc_id,
+                    "text": "\n".join(ordered_sentences),
+                    "is_positive": bool(document["is_positive"]),
                 }
             )
-        positives = [document for document in aggregated_documents if document['is_positive']]
-        negatives = [document for document in aggregated_documents if not document['is_positive']]
+        positives = [document for document in aggregated_documents if document["is_positive"]]
+        negatives = [document for document in aggregated_documents if not document["is_positive"]]
         positive_docs += len(positives)
         negative_docs += len(negatives)
         if not positives or not negatives:
@@ -259,43 +472,44 @@ def _build_document_pairwise_examples(dataset, positive_label_indices: Sequence[
             for negative_document in negatives:
                 pair_examples.append(
                     {
-                        'pair_id': f"{group_id}:{positive_document['doc_id']}>{negative_document['doc_id']}",
-                        'group_id': group_id,
-                        'claim': positive_document['claim'],
-                        'positive_text': positive_document['text'],
-                        'negative_text': negative_document['text'],
+                        "pair_id": f"{group_id}:{positive_document['doc_id']}>{negative_document['doc_id']}",
+                        "group_id": group_id,
+                        "claim": positive_document["claim"],
+                        "positive_text": positive_document["text"],
+                        "negative_text": negative_document["text"],
                     }
                 )
 
     return pair_examples, {
-        'pairwise_level': 'document',
-        'num_pairs': len(pair_examples),
-        'num_groups_with_pairs': groups_with_pairs,
-        'num_positive_examples': positive_docs,
-        'num_negative_examples': negative_docs,
+        "objective": "pairwise",
+        "pairwise_level": "document",
+        "num_pairs": len(pair_examples),
+        "num_groups_with_pairs": groups_with_pairs,
+        "num_positive_examples": positive_docs,
+        "num_negative_examples": negative_docs,
     }
 
 
 def _build_sentence_pairwise_examples(dataset, positive_label_indices: Sequence[int]):
     grouped_examples: Dict[str, Dict[str, object]] = {}
     for row in dataset:
-        group_id = str(row['group_id'])
+        group_id = str(row["group_id"])
         group = grouped_examples.setdefault(
             group_id,
             {
-                'claim': str(row['claim']),
-                'positives': [],
-                'negatives': [],
+                "claim": str(row["claim"]),
+                "positives": [],
+                "negatives": [],
             },
         )
         example = {
-            'example_id': str(row['example_id']),
-            'text': str(row['evidence_text']),
+            "example_id": str(row["example_id"]),
+            "text": str(row["evidence_text"]),
         }
-        if int(row['label']) in positive_label_indices:
-            group['positives'].append(example)
+        if int(row["label"]) in positive_label_indices:
+            group["positives"].append(example)
         else:
-            group['negatives'].append(example)
+            group["negatives"].append(example)
 
     pair_examples = []
     positive_examples = 0
@@ -303,8 +517,8 @@ def _build_sentence_pairwise_examples(dataset, positive_label_indices: Sequence[
     groups_with_pairs = 0
     for group_id in sorted(grouped_examples):
         group = grouped_examples[group_id]
-        positives = list(group['positives'])
-        negatives = list(group['negatives'])
+        positives = list(group["positives"])
+        negatives = list(group["negatives"])
         positive_examples += len(positives)
         negative_examples += len(negatives)
         if not positives or not negatives:
@@ -314,32 +528,72 @@ def _build_sentence_pairwise_examples(dataset, positive_label_indices: Sequence[
             for negative_example in negatives:
                 pair_examples.append(
                     {
-                        'pair_id': f"{group_id}:{positive_example['example_id']}>{negative_example['example_id']}",
-                        'group_id': group_id,
-                        'claim': str(group['claim']),
-                        'positive_text': positive_example['text'],
-                        'negative_text': negative_example['text'],
+                        "pair_id": f"{group_id}:{positive_example['example_id']}>{negative_example['example_id']}",
+                        "group_id": group_id,
+                        "claim": str(group["claim"]),
+                        "positive_text": positive_example["text"],
+                        "negative_text": negative_example["text"],
                     }
                 )
 
     return pair_examples, {
-        'pairwise_level': 'sentence',
-        'num_pairs': len(pair_examples),
-        'num_groups_with_pairs': groups_with_pairs,
-        'num_positive_examples': positive_examples,
-        'num_negative_examples': negative_examples,
+        "objective": "pairwise",
+        "pairwise_level": "sentence",
+        "num_pairs": len(pair_examples),
+        "num_groups_with_pairs": groups_with_pairs,
+        "num_positive_examples": positive_examples,
+        "num_negative_examples": negative_examples,
     }
 
 
-def build_pairwise_ranking_examples(dataset, label_names: Sequence[str], pairwise_level: str = 'sentence'):
+def build_pairwise_ranking_examples(dataset, label_names: Sequence[str], pairwise_level: str = "sentence"):
     positive_label_indices, negative_label_indices = resolve_positive_negative_label_indices(label_names)
     if len(positive_label_indices) != 1 or len(negative_label_indices) != 1:
-        raise ValueError('pairwise ranking objective currently expects exactly one positive and one negative relevance label')
-    if pairwise_level == 'document':
+        raise ValueError("pairwise ranking objective currently expects exactly one positive and one negative relevance label")
+    if pairwise_level == "document":
         return _build_document_pairwise_examples(dataset, positive_label_indices)
-    if pairwise_level == 'sentence':
+    if pairwise_level == "sentence":
         return _build_sentence_pairwise_examples(dataset, positive_label_indices)
-    raise ValueError(f'unsupported pairwise_level: {pairwise_level}')
+    raise ValueError(f"unsupported pairwise_level: {pairwise_level}")
+
+
+def build_inbatch_document_ranking_examples(dataset, label_names: Sequence[str]):
+    positive_label_indices, negative_label_indices = resolve_positive_negative_label_indices(label_names)
+    if len(negative_label_indices) != 1:
+        raise ValueError("in-batch document ranking objective expects exactly one negative relevance label")
+    grouped_documents = _group_documents(dataset, positive_label_indices)
+    examples = []
+    positive_doc_counts: List[int] = []
+    for group_id in sorted(grouped_documents):
+        positives = []
+        for doc_id in sorted(grouped_documents[group_id]):
+            document = grouped_documents[group_id][doc_id]
+            if not document["is_positive"]:
+                continue
+            ordered_sentences = [document["sentences"][sentence_id] for sentence_id in sorted(document["sentences"])]
+            positives.append(
+                {
+                    "example_id": f"{group_id}:{doc_id}",
+                    "sample_id": document["sample_id"],
+                    "dataset": document["dataset"],
+                    "group_id": group_id,
+                    "claim": document["claim"],
+                    "doc_id": doc_id,
+                    "document_text": "\n".join(ordered_sentences),
+                }
+            )
+        if positives:
+            positive_doc_counts.append(len(positives))
+            examples.extend(positives)
+
+    num_groups = len(positive_doc_counts)
+    return examples, {
+        "objective": "inbatch_document",
+        "num_examples": len(examples),
+        "num_groups": num_groups,
+        "groups_with_multiple_positive_docs": sum(1 for count in positive_doc_counts if count > 1),
+        "avg_positive_docs_per_group": round(sum(positive_doc_counts) / max(num_groups, 1), 6),
+    }
 
 
 def tokenize_pairwise_ranking_dataset(
@@ -347,38 +601,134 @@ def tokenize_pairwise_ranking_dataset(
     tokenizer,
     max_length: int,
     label_names: Sequence[str],
-    pairwise_level: str = 'sentence',
+    pairwise_level: str = "sentence",
 ):
     pair_examples, stats = build_pairwise_ranking_examples(dataset, label_names, pairwise_level=pairwise_level)
     if not pair_examples:
-        raise ValueError('pairwise ranking objective requires at least one positive/negative pair')
+        raise ValueError("pairwise ranking objective requires at least one positive/negative pair")
     pair_dataset = Dataset.from_list(pair_examples)
 
     def _tokenize(batch):
         positive_encoded = tokenizer(
-            batch['claim'],
-            batch['positive_text'],
+            batch["claim"],
+            batch["positive_text"],
             truncation=True,
             max_length=max_length,
             padding=False,
         )
         negative_encoded = tokenizer(
-            batch['claim'],
-            batch['negative_text'],
+            batch["claim"],
+            batch["negative_text"],
             truncation=True,
             max_length=max_length,
             padding=False,
         )
-        encoded = {f'positive_{key}': value for key, value in positive_encoded.items()}
-        encoded.update({f'negative_{key}': value for key, value in negative_encoded.items()})
-        encoded['length'] = [
+        encoded = {f"positive_{key}": value for key, value in positive_encoded.items()}
+        encoded.update({f"negative_{key}": value for key, value in negative_encoded.items()})
+        encoded["length"] = [
             max(len(positive_ids), len(negative_ids))
-            for positive_ids, negative_ids in zip(positive_encoded['input_ids'], negative_encoded['input_ids'])
+            for positive_ids, negative_ids in zip(positive_encoded["input_ids"], negative_encoded["input_ids"])
         ]
         return encoded
 
     tokenized = pair_dataset.map(_tokenize, batched=True, remove_columns=pair_dataset.column_names)
     return tokenized, stats
+
+
+def build_inbatch_document_ranking_dataset(dataset, tokenizer, max_length: int, label_names: Sequence[str]):
+    examples, stats = build_inbatch_document_ranking_examples(dataset, label_names)
+    if not examples:
+        raise ValueError("in-batch document ranking objective requires at least one positive document example")
+    document_dataset = Dataset.from_list(examples)
+
+    def _measure_length(batch):
+        encoded = tokenizer(
+            batch["claim"],
+            batch["document_text"],
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
+        return {"length": [len(input_ids) for input_ids in encoded["input_ids"]]}
+
+    measured = document_dataset.map(_measure_length, batched=True)
+    return measured, stats
+
+
+def build_document_listwise_ranking_examples(dataset, label_names: Sequence[str]):
+    positive_label_indices, negative_label_indices = resolve_positive_negative_label_indices(label_names)
+    if len(positive_label_indices) != 1 or len(negative_label_indices) != 1:
+        raise ValueError("document listwise objective currently expects exactly one positive and one negative relevance label")
+    grouped_documents = _group_documents(dataset, positive_label_indices)
+    groups = []
+    positive_docs = 0
+    negative_docs = 0
+    groups_with_multiple_positive_docs = 0
+    for group_id in sorted(grouped_documents):
+        documents_by_id = grouped_documents[group_id]
+        aggregated_documents = []
+        for doc_id in sorted(documents_by_id):
+            document = documents_by_id[doc_id]
+            ordered_sentences = [document["sentences"][sentence_id] for sentence_id in sorted(document["sentences"])]
+            aggregated_documents.append(
+                {
+                    "doc_id": doc_id,
+                    "text": "\n".join(ordered_sentences),
+                    "is_positive": bool(document["is_positive"]),
+                }
+            )
+        positives = [document for document in aggregated_documents if document["is_positive"]]
+        negatives = [document for document in aggregated_documents if not document["is_positive"]]
+        positive_docs += len(positives)
+        negative_docs += len(negatives)
+        if len(positives) > 1:
+            groups_with_multiple_positive_docs += 1
+        if not positives or not negatives:
+            continue
+        first_doc_id = aggregated_documents[0]["doc_id"]
+        groups.append(
+            {
+                "group_id": group_id,
+                "claim": str(documents_by_id[first_doc_id]["claim"]),
+                "documents": aggregated_documents,
+            }
+        )
+
+    return groups, {
+        "objective": "document_listwise",
+        "num_groups": len(groups),
+        "num_docs": sum(len(group["documents"]) for group in groups),
+        "num_positive_docs": positive_docs,
+        "num_negative_docs": negative_docs,
+        "groups_with_multiple_positive_docs": groups_with_multiple_positive_docs,
+    }
+
+
+def build_document_listwise_ranking_dataset(dataset, tokenizer, max_length: int, label_names: Sequence[str]):
+    groups, stats = build_document_listwise_ranking_examples(dataset, label_names)
+    if not groups:
+        raise ValueError("document listwise objective requires at least one mixed positive/negative document group")
+    group_dataset = Dataset.from_list(groups)
+
+    def _measure_length(batch):
+        lengths = []
+        for claim, documents in zip(batch["claim"], batch["documents"]):
+            doc_texts = [str(document["text"]) for document in documents]
+            if not doc_texts:
+                lengths.append(0)
+                continue
+            encoded = tokenizer(
+                [str(claim)] * len(doc_texts),
+                doc_texts,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+            )
+            lengths.append(max(len(input_ids) for input_ids in encoded["input_ids"]) if encoded["input_ids"] else 0)
+        return {"length": lengths}
+
+    measured = group_dataset.map(_measure_length, batched=True)
+    return measured, stats
 
 
 def compute_balanced_class_weights(labels, num_labels: int) -> List[float]:
@@ -403,19 +753,19 @@ def compute_example_sampling_weights(labels, num_labels: int) -> List[float]:
     return [class_weights[int(label)] for label in labels]
 
 
-def select_model_inputs(inputs, prefix: str = '') -> Dict[str, torch.Tensor]:
+def select_model_inputs(inputs, prefix: str = "") -> Dict[str, torch.Tensor]:
     model_inputs: Dict[str, torch.Tensor] = {}
     for key in MODEL_INPUT_KEYS:
-        prefixed_key = f'{prefix}{key}'
+        prefixed_key = f"{prefix}{key}"
         if prefixed_key in inputs:
             model_inputs[key] = inputs[prefixed_key]
     return model_inputs
 
 
 def compute_classification_loss(model, inputs, class_weights: Optional[torch.Tensor] = None):
-    labels = inputs['labels']
+    labels = inputs["labels"]
     outputs = model(**select_model_inputs(inputs))
-    logits = outputs.get('logits')
+    logits = outputs.get("logits")
     weights = class_weights.to(logits.device) if class_weights is not None else None
     loss = torch.nn.functional.cross_entropy(logits, labels, weight=weights)
     return loss, outputs
@@ -439,11 +789,101 @@ def compute_pairwise_ranking_loss(
     negative_logits: torch.Tensor,
     positive_label_indices: Sequence[int],
     negative_label_indices: Sequence[int],
+    loss_type: str = "softplus",
+    margin: float = 0.5,
 ) -> torch.Tensor:
     positive_scores = compute_positive_scores(positive_logits, positive_label_indices, negative_label_indices)
     negative_scores = compute_positive_scores(negative_logits, positive_label_indices, negative_label_indices)
-    margins = positive_scores - negative_scores
-    return torch.nn.functional.softplus(-margins).mean()
+    score_delta = positive_scores - negative_scores
+    if loss_type == "softplus":
+        return torch.nn.functional.softplus(-score_delta).mean()
+    if loss_type == "margin":
+        return torch.nn.functional.relu(float(margin) - score_delta).mean()
+    raise ValueError(f"unsupported pairwise loss_type: {loss_type}")
+
+
+def compute_inbatch_document_ranking_loss(
+    *,
+    logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    positive_label_indices: Sequence[int],
+    negative_label_indices: Sequence[int],
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    if logits.ndim != 3:
+        raise ValueError("in-batch document ranking expects [batch, batch, num_labels] logits")
+    batch_size, _, num_labels = logits.shape
+    scores = compute_positive_scores(
+        logits.view(batch_size * batch_size, num_labels),
+        positive_label_indices,
+        negative_label_indices,
+    ).view(batch_size, batch_size)
+    denom_temperature = max(float(temperature), 1e-6)
+    scores = scores / denom_temperature
+    positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
+    valid_rows = positive_mask.any(dim=1)
+    if not bool(valid_rows.any()):
+        raise ValueError("in-batch document ranking requires at least one positive document per anchor claim")
+    scores = scores[valid_rows]
+    positive_mask = positive_mask[valid_rows]
+    positive_scores = scores.masked_fill(~positive_mask, float("-inf"))
+    positive_logsumexp = torch.logsumexp(positive_scores, dim=1)
+    all_logsumexp = torch.logsumexp(scores, dim=1)
+    return (all_logsumexp - positive_logsumexp).mean()
+
+
+def compute_document_listwise_ranking_loss(
+    *,
+    logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    doc_mask: torch.Tensor,
+    group_sizes: Optional[torch.Tensor] = None,
+    positive_label_indices: Sequence[int],
+    negative_label_indices: Sequence[int],
+    top_k: int = 3,
+    margin: float = 0.1,
+    margin_weight: float = 1.0,
+) -> torch.Tensor:
+    if logits.ndim == 3:
+        batch_size, max_docs, num_labels = logits.shape
+        if group_sizes is None:
+            group_sizes = [int(mask.to(dtype=torch.long).sum().item()) for mask in doc_mask]
+        logits = logits.view(batch_size * max_docs, num_labels)
+    elif logits.ndim != 2:
+        raise ValueError("document listwise ranking expects [total_docs, num_labels] or [batch, max_docs, num_labels] logits")
+    scores = compute_positive_scores(logits, positive_label_indices, negative_label_indices)
+    if group_sizes is None:
+        group_sizes = [int(mask.to(dtype=torch.long).sum().item()) for mask in doc_mask]
+    else:
+        group_sizes = group_sizes.tolist() if isinstance(group_sizes, torch.Tensor) else list(group_sizes)
+    losses = []
+    offset = 0
+    for row_index, group_size in enumerate(group_sizes):
+        group_size = int(group_size)
+        group_scores = scores[offset : offset + group_size]
+        offset += group_size
+        if group_scores.numel() == 0:
+            continue
+        valid_mask = doc_mask[row_index, :group_size].to(device=group_scores.device, dtype=torch.bool)
+        positive_row = positive_mask[row_index, :group_size].to(device=group_scores.device, dtype=torch.bool)
+        group_scores = group_scores[valid_mask]
+        positive_row = positive_row[valid_mask]
+        if not bool(positive_row.any()) or bool(positive_row.all()):
+            continue
+        positive_scores = group_scores[positive_row]
+        negative_scores = group_scores[~positive_row]
+        listwise_loss = torch.logsumexp(group_scores, dim=0) - torch.logsumexp(positive_scores, dim=0)
+        if negative_scores.numel() and top_k > 0:
+            effective_k = min(int(top_k), int(negative_scores.numel()))
+            kth_negative = torch.topk(negative_scores, k=effective_k, largest=True).values[-1]
+            best_positive = torch.max(positive_scores)
+            topk_margin_loss = torch.nn.functional.relu(float(margin) - (best_positive - kth_negative))
+            losses.append(listwise_loss + float(margin_weight) * topk_margin_loss)
+        else:
+            losses.append(listwise_loss)
+    if not losses:
+        raise ValueError("document listwise ranking requires at least one group with both positive and negative documents")
+    return torch.stack(losses).mean()
 
 
 def build_training_args(args: argparse.Namespace, use_cpu: bool) -> TrainingArguments:
@@ -455,43 +895,49 @@ def build_training_args(args: argparse.Namespace, use_cpu: bool) -> TrainingArgu
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,
-        evaluation_strategy='steps',
+        evaluation_strategy="steps",
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
-        save_strategy='steps',
+        save_strategy="steps",
         fp16=not use_cpu,
         bf16=False,
         no_cuda=use_cpu,
         dataloader_num_workers=0,
-        remove_unused_columns=args.training_objective != 'pairwise',
+        remove_unused_columns=args.training_objective == "classification",
         save_total_limit=2,
         report_to=[],
-        group_by_length=args.class_balance != 'sampler',
-        length_column_name='length',
+        group_by_length=args.class_balance != "sampler",
+        length_column_name="length",
         ddp_find_unused_parameters=False,
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_file', type=Path, required=True)
-    parser.add_argument('--eval_file', type=Path, required=True)
-    parser.add_argument('--output_dir', type=Path, required=True)
-    parser.add_argument('--model_name_or_path', default='')
-    parser.add_argument('--max_length', type=int, default=384)
-    parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--num_train_epochs', type=int, default=3)
-    parser.add_argument('--per_device_train_batch_size', type=int, default=8)
-    parser.add_argument('--per_device_eval_batch_size', type=int, default=8)
-    parser.add_argument('--logging_steps', type=int, default=10)
-    parser.add_argument('--eval_steps', type=int, default=50)
-    parser.add_argument('--save_steps', type=int, default=50)
-    parser.add_argument('--max_steps', type=int, default=-1)
-    parser.add_argument('--attn_implementation', default='sdpa')
-    parser.add_argument('--class_balance', choices=['none', 'loss', 'sampler'], default='none')
-    parser.add_argument('--training_objective', choices=['classification', 'pairwise'], default='classification')
-    parser.add_argument('--pairwise_level', choices=['sentence', 'document'], default='sentence')
-    parser.add_argument('--smoke_test', action='store_true')
+    parser.add_argument("--train_file", type=Path, required=True)
+    parser.add_argument("--eval_file", type=Path, required=True)
+    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--model_name_or_path", default="")
+    parser.add_argument("--max_length", type=int, default=384)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=50)
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--attn_implementation", default="sdpa")
+    parser.add_argument("--class_balance", choices=["none", "loss", "sampler"], default="none")
+    parser.add_argument("--training_objective", choices=["classification", "pairwise", "inbatch_document", "document_listwise"], default="classification")
+    parser.add_argument("--pairwise_level", choices=["sentence", "document"], default="sentence")
+    parser.add_argument("--pairwise_loss", choices=["softplus", "margin"], default="softplus")
+    parser.add_argument("--pairwise_margin", type=float, default=0.5)
+    parser.add_argument("--inbatch_temperature", type=float, default=1.0)
+    parser.add_argument("--listwise_top_k", type=int, default=3)
+    parser.add_argument("--listwise_margin", type=float, default=0.1)
+    parser.add_argument("--listwise_margin_weight", type=float, default=1.0)
+    parser.add_argument("--smoke_test", action="store_true")
     return parser.parse_args()
 
 
@@ -500,8 +946,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     set_runtime_env()
 
-    if args.training_objective == 'pairwise' and args.class_balance != 'none':
-        raise ValueError('pairwise ranking objective currently requires class_balance=none')
+    if args.training_objective in {"pairwise", "inbatch_document", "document_listwise"} and args.class_balance != "none":
+        raise ValueError(f"{args.training_objective} objective currently requires class_balance=none")
 
     train_dataset_raw, eval_dataset_raw, label_names = load_verifier_datasets(args.train_file, args.eval_file)
     positive_label_indices, negative_label_indices = resolve_positive_negative_label_indices(label_names)
@@ -522,66 +968,116 @@ def main() -> None:
         )
         use_cpu = True
 
-    pairwise_stats = None
-    if args.training_objective == 'pairwise':
-        train_dataset, pairwise_stats = tokenize_pairwise_ranking_dataset(
+    objective_stats = None
+    if args.training_objective == "pairwise":
+        train_dataset, objective_stats = tokenize_pairwise_ranking_dataset(
             train_dataset_raw,
             tokenizer,
             args.max_length,
             label_names,
             pairwise_level=args.pairwise_level,
         )
+    elif args.training_objective == "inbatch_document":
+        train_dataset, objective_stats = build_inbatch_document_ranking_dataset(
+            train_dataset_raw,
+            tokenizer,
+            args.max_length,
+            label_names,
+        )
+    elif args.training_objective == "document_listwise":
+        train_dataset, objective_stats = build_document_listwise_ranking_dataset(
+            train_dataset_raw,
+            tokenizer,
+            args.max_length,
+            label_names,
+        )
     else:
         train_dataset = tokenize_verifier_dataset(train_dataset_raw, tokenizer, args.max_length)
     eval_dataset = tokenize_verifier_dataset(eval_dataset_raw, tokenizer, args.max_length)
     training_args = build_training_args(args, use_cpu=use_cpu)
 
-    labels = list(train_dataset_raw['label'])
+    labels = list(train_dataset_raw["label"])
     class_weights = None
     sample_weights = None
-    if args.class_balance == 'loss':
+    if args.class_balance == "loss":
         class_weights = compute_balanced_class_weights(labels, len(label_names))
-        with (args.output_dir / 'class_weights.json').open('w', encoding='utf-8') as handle:
+        with (args.output_dir / "class_weights.json").open("w", encoding="utf-8") as handle:
             json.dump(
                 {
-                    'class_balance': args.class_balance,
-                    'label_names': label_names,
-                    'class_weights': class_weights,
+                    "class_balance": args.class_balance,
+                    "label_names": label_names,
+                    "class_weights": class_weights,
                 },
                 handle,
                 ensure_ascii=False,
                 indent=2,
             )
-    elif args.class_balance == 'sampler':
+    elif args.class_balance == "sampler":
         sample_weights = compute_example_sampling_weights(labels, len(label_names))
-        with (args.output_dir / 'sampling_weights.json').open('w', encoding='utf-8') as handle:
+        with (args.output_dir / "sampling_weights.json").open("w", encoding="utf-8") as handle:
             json.dump(
                 {
-                    'class_balance': args.class_balance,
-                    'label_names': label_names,
-                    'class_weights': compute_balanced_class_weights(labels, len(label_names)),
-                    'num_examples': len(sample_weights),
-                    'weight_min': min(sample_weights) if sample_weights else 0.0,
-                    'weight_max': max(sample_weights) if sample_weights else 0.0,
+                    "class_balance": args.class_balance,
+                    "label_names": label_names,
+                    "class_weights": compute_balanced_class_weights(labels, len(label_names)),
+                    "num_examples": len(sample_weights),
+                    "weight_min": min(sample_weights) if sample_weights else 0.0,
+                    "weight_max": max(sample_weights) if sample_weights else 0.0,
                 },
                 handle,
                 ensure_ascii=False,
                 indent=2,
             )
 
-    if args.training_objective == 'pairwise':
-        train_data_collator = PairwiseDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
-        eval_data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
+    if args.training_objective == "pairwise":
         trainer = PairwiseRankingTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             tokenizer=tokenizer,
-            train_data_collator=train_data_collator,
-            eval_data_collator=eval_data_collator,
+            train_data_collator=PairwiseDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8),
+            eval_data_collator=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8),
             positive_label_indices=positive_label_indices,
             negative_label_indices=negative_label_indices,
+            pairwise_loss=args.pairwise_loss,
+            pairwise_margin=args.pairwise_margin,
+        )
+    elif args.training_objective == "inbatch_document":
+        trainer = InBatchDocumentRankingTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            train_data_collator=InBatchDocumentDataCollator(
+                tokenizer=tokenizer,
+                max_length=args.max_length,
+                pad_to_multiple_of=8,
+            ),
+            eval_data_collator=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8),
+            positive_label_indices=positive_label_indices,
+            negative_label_indices=negative_label_indices,
+            inbatch_temperature=args.inbatch_temperature,
+        )
+    elif args.training_objective == "document_listwise":
+        trainer = DocumentListwiseRankingTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            train_data_collator=DocumentListwiseDataCollator(
+                tokenizer=tokenizer,
+                max_length=args.max_length,
+                pad_to_multiple_of=8,
+            ),
+            eval_data_collator=DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8),
+            positive_label_indices=positive_label_indices,
+            negative_label_indices=negative_label_indices,
+            listwise_top_k=args.listwise_top_k,
+            listwise_margin=args.listwise_margin,
+            listwise_margin_weight=args.listwise_margin_weight,
         )
     else:
         data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
@@ -624,46 +1120,55 @@ def main() -> None:
         logits=logits,
         labels=prediction_output.label_ids,
         label_names=label_names,
-        group_ids=list(eval_dataset_raw['group_id']),
+        group_ids=list(eval_dataset_raw["group_id"]),
     )
     train_metrics = train_result.metrics
     if not trainer.is_world_process_zero():
         return
 
     tokenizer.save_pretrained(args.output_dir)
-    with (args.output_dir / 'training_args.json').open('w', encoding='utf-8') as handle:
+    with (args.output_dir / "training_args.json").open("w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, ensure_ascii=False, indent=2, default=str)
-    with (args.output_dir / 'train_metrics.json').open('w', encoding='utf-8') as handle:
+    with (args.output_dir / "train_metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(train_metrics, handle, ensure_ascii=False, indent=2, default=str)
-    with (args.output_dir / 'eval_metrics.json').open('w', encoding='utf-8') as handle:
+    with (args.output_dir / "eval_metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(eval_metrics, handle, ensure_ascii=False, indent=2, default=str)
-    with (args.output_dir / 'label_names.json').open('w', encoding='utf-8') as handle:
+    with (args.output_dir / "label_names.json").open("w", encoding="utf-8") as handle:
         json.dump(label_names, handle, ensure_ascii=False, indent=2)
-    if pairwise_stats is not None:
-        with (args.output_dir / 'pairwise_stats.json').open('w', encoding='utf-8') as handle:
-            json.dump(pairwise_stats, handle, ensure_ascii=False, indent=2)
+    if objective_stats is not None:
+        with (args.output_dir / "objective_stats.json").open("w", encoding="utf-8") as handle:
+            json.dump(objective_stats, handle, ensure_ascii=False, indent=2)
+        if args.training_objective == "pairwise":
+            with (args.output_dir / "pairwise_stats.json").open("w", encoding="utf-8") as handle:
+                json.dump(objective_stats, handle, ensure_ascii=False, indent=2)
     print(
         json.dumps(
             {
-                'output_dir': str(args.output_dir),
-                'label_names': label_names,
-                'class_balance': args.class_balance,
-                'training_objective': args.training_objective,
-                'pairwise_level': args.pairwise_level,
-                'class_weights': class_weights,
-                'sample_weights': {
-                    'num_examples': len(sample_weights),
-                    'weight_min': min(sample_weights),
-                    'weight_max': max(sample_weights),
+                "output_dir": str(args.output_dir),
+                "label_names": label_names,
+                "class_balance": args.class_balance,
+                "training_objective": args.training_objective,
+                "pairwise_level": args.pairwise_level,
+                "pairwise_loss": args.pairwise_loss,
+                "pairwise_margin": args.pairwise_margin,
+                "inbatch_temperature": args.inbatch_temperature,
+                "listwise_top_k": args.listwise_top_k,
+                "listwise_margin": args.listwise_margin,
+                "listwise_margin_weight": args.listwise_margin_weight,
+                "class_weights": class_weights,
+                "sample_weights": {
+                    "num_examples": len(sample_weights),
+                    "weight_min": min(sample_weights),
+                    "weight_max": max(sample_weights),
                 } if sample_weights is not None else None,
-                'pairwise_stats': pairwise_stats,
-                'train_metrics': train_metrics,
-                'eval_metrics': eval_metrics,
+                "objective_stats": objective_stats,
+                "train_metrics": train_metrics,
+                "eval_metrics": eval_metrics,
             },
             ensure_ascii=False,
         )
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

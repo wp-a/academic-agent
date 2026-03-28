@@ -248,6 +248,26 @@ class VerifierTrainerTest(unittest.TestCase):
         )
         self.assertLess(float(low_loss), float(high_loss))
 
+    def test_compute_pairwise_ranking_loss_supports_margin_variant(self):
+        low_loss = compute_pairwise_ranking_loss(
+            positive_logits=torch.tensor([[0.1, 2.0]], dtype=torch.float32),
+            negative_logits=torch.tensor([[1.5, 0.2]], dtype=torch.float32),
+            positive_label_indices=[1],
+            negative_label_indices=[0],
+            loss_type='margin',
+            margin=0.5,
+        )
+        high_loss = compute_pairwise_ranking_loss(
+            positive_logits=torch.tensor([[1.5, 0.2]], dtype=torch.float32),
+            negative_logits=torch.tensor([[0.1, 2.0]], dtype=torch.float32),
+            positive_label_indices=[1],
+            negative_label_indices=[0],
+            loss_type='margin',
+            margin=0.5,
+        )
+        self.assertEqual(float(low_loss), 0.0)
+        self.assertGreater(float(high_loss), 0.0)
+
     def test_pairwise_trainer_uses_pointwise_eval_collator(self):
         train_raw = Dataset.from_list(
             [

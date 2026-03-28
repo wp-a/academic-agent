@@ -170,5 +170,6 @@ def build_restricted_episode(
         doc_pool=list(document_map.keys()),
         gold_evidence=gold_evidence,
         document_contents=build_document_contents(document_map),
+        document_sentences={doc_id: [str(sentence) for sentence in sentences] for doc_id, sentences in document_map.items()},
         max_steps=max_steps,
     )

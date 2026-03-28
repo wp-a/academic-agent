@@ -4,8 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from train_agent.models.action_policy import FrozenActionPolicy
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,6 +13,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state_text", default="")
     parser.add_argument("--state_text_file", type=Path)
     parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--attn_implementation", default="sdpa")
     return parser.parse_args()
 
 
@@ -26,27 +27,18 @@ def main() -> None:
     else:
         raise ValueError("Provide --state_text or --state_text_file.")
 
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
-    with (args.model_dir / "label_names.json").open("r", encoding="utf-8") as handle:
-        label_names = json.load(handle)
-
-    model.eval()
-    encoded = tokenizer(
-        state_text,
-        truncation=True,
+    policy = FrozenActionPolicy(
+        args.model_dir,
         max_length=args.max_length,
-        return_tensors="pt",
+        batch_size=args.batch_size,
+        attn_implementation=args.attn_implementation,
     )
-    with torch.no_grad():
-        outputs = model(**encoded)
-        probs = torch.softmax(outputs.logits, dim=-1)[0]
-        pred_id = int(torch.argmax(probs).item())
-
+    logits = policy.predict_logits([state_text])[0]
+    pred_id = max(range(len(logits)), key=lambda idx: logits[idx])
     result = {
         "predicted_label_id": pred_id,
-        "predicted_action_type": label_names[pred_id],
-        "scores": {label_names[i]: round(float(probs[i].item()), 6) for i in range(len(label_names))},
+        "predicted_action_type": policy.label_names[pred_id],
+        "scores": {policy.label_names[i]: round(float(logits[i]), 6) for i in range(len(logits))},
     }
     print(json.dumps(result, ensure_ascii=False))
 
