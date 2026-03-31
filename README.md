@@ -15,6 +15,7 @@
 - frozen verifier 下的 restricted ranking 评测
 - weakly-coupled replay 的 action / stop 数据导出
 - hard replay 的 action / stop 数据导出
+- hard replay residual mismatch episode diagnostics 与 student-visited off-policy state 导出
 - action policy 小分类 baseline
 - `Qwen2.5-3B-Instruct` LoRA action policy 主线
 - `Qwen2.5-3B-Instruct` LoRA stop policy 主线
@@ -131,6 +132,7 @@
 - 通过 `train_agent/data/adapters/scifact_hard.py` 为每个 episode 追加词汇重叠但非 gold 的干扰文档
 - 通过 `train_agent/scripts/export_scifact_hard_replay_data.py` 导出更保守 teacher 的 action / stop 数据
 - 通过 `train_agent/scripts/eval_action_policy_offline_replay.py --num_distractor_docs N --reference_policy_type conservative --post_quote_search_budget 1` 在 offline replay 中打开与 hard 导出 teacher 对齐的评测
+- 通过 `train_agent/scripts/eval_action_policy_offline_replay.py --diagnostics_output_path ... --off_policy_action_output_path ... --off_policy_stop_output_path ...` 导出 residual mismatch episode diagnostics 与从首次偏离开始的 student-visited off-policy states
 
 ## 3. 目录结构
 
@@ -294,6 +296,31 @@ hard replay joint 输出：
 - validation `quote_evidence_hit_rate = 1.0`
 - validation `reference_policy_type = conservative`
 - validation `post_quote_search_budget = 1`
+- validation `mismatch_episode_count = 2`
+- validation `mismatch_step_count = 2`
+- validation `off_policy_episode_count = 2`
+- validation `off_policy_action_examples = 3`
+- validation `off_policy_stop_examples = 3`
+
+### 6.7 Residual mismatch diagnostics 与 off-policy 导出
+
+当前 hard validation 的 residual mismatch 产物：
+
+- `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl`
+- `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl`
+- `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl`
+
+当前导出语义：
+
+- 保留 mismatch-only 的 rich diagnostics，便于做 episode-level 失败分析
+- 一旦 student action 首次偏离 reference teacher，就把该步以及之后 student 真正访问到的 state 导出为训练就绪 JSONL
+- action / stop 两份 off-policy JSONL 复用现有训练 schema，可直接作为后续 stronger teacher 标注或 DAgger-style 增量数据入口
+
+当前 validation 上的第一批 off-policy 数据规模：
+
+- `2` 个 off-policy episodes
+- `3` 条 action records
+- `3` 条 stop records
 
 ## 7. 关键命令
 
@@ -362,6 +389,12 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3 --reference_policy_type conservative --post_quote_search_budget 1"
 ```
 
+### 7.9 导出 hard replay residual mismatch diagnostics 与 off-policy states
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --diagnostics_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl --off_policy_action_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl --off_policy_stop_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3 --reference_policy_type conservative --post_quote_search_budget 1"
+```
+
 ## 8. 当前结论
 
 ### 8.1 关于 verifier
@@ -392,17 +425,20 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 
 - hard replay 数据导出使用的是 `ConservativeReplayPolicy`
 - `eval_action_policy_offline_replay.py` 现已支持 `--reference_policy_type {weak,conservative}` 与 `--post_quote_search_budget`
+- `eval_action_policy_offline_replay.py` 现已支持 residual mismatch diagnostics 与 student-visited off-policy state 导出
 - 当前 hard joint 指标应使用 teacher-aligned 的 conservative reference 结果来解读
 - 对齐后 `action_agreement = 0.998564`、`stop_recall = 0.996865`
 - 旧的 `0.814788 / 0.552265` 是 reference mismatch 造成的历史结果，不应继续作为当前主结论
+- 当前 hard validation 的 residual mismatch 只剩 `2` 个 episodes / `2` 个 steps，主要是 stop gating 边界问题而不是整条策略崩坏
+- 当前已经能直接把这些 student-visited off-policy states 导出为训练就绪数据，为 stronger teacher 标注或 DAgger-style 增量训练做准备
 
 ## 9. 下一步建议
 
 建议按下面顺序继续推进：
 
 1. 保持 frozen verifier 不动
-2. 直接对 hard replay 中剩余的少量 mismatch episode 做更严格的 disagreement / stop 失败诊断
-3. 然后继续扩展 action policy / stop policy replay 数据和评测切面
+2. 用当前 off-policy 导出接口持续收集 student-visited rollout states，而不是只看聚合指标
+3. 在这些 off-policy states 上引入更强 teacher 标注，再做 DAgger-style 增量数据混入
 4. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
 
 当前不建议直接做：

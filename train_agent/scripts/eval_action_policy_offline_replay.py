@@ -4,7 +4,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from datasets import load_dataset
 
@@ -13,9 +13,10 @@ from train_agent.data.adapters.scifact_hard import augment_episode_with_lexical_
 from train_agent.models.action_policy import FrozenActionPolicy
 from train_agent.models.stop_policy import FrozenStopPolicy
 from train_agent.models.verifier import FrozenSequenceVerifier
-from train_agent.rl.restricted_retrieval import RestrictedRetrievalEpisode, RestrictedRetrievalEnv
+from train_agent.rl.restricted_retrieval import RestrictedEvidence, RestrictedRetrievalEpisode, RestrictedRetrievalEnv
 from train_agent.scripts.export_scifact_frozen_verifier_replay import WeakCoupledReplayPolicy, build_scifact_corpus_map
 from train_agent.scripts.export_scifact_hard_replay_data import ConservativeReplayPolicy
+from train_agent.scripts.export_scifact_stop_policy_data import convert_action_record_to_stop_record
 
 
 def build_corpus_text_by_doc(corpus_map: Dict[str, object]) -> Dict[str, str]:
@@ -87,6 +88,91 @@ def _build_reference_policy(
     raise ValueError(f"Unsupported reference_policy_type: {reference_policy_type}")
 
 
+def _serialize_evidence(items: Sequence[RestrictedEvidence]) -> List[Dict[str, object]]:
+    return [
+        {
+            "doc_id": item.doc_id,
+            "sentence_ids": list(item.sentence_ids),
+            "stance": item.stance,
+            "snippet": item.snippet,
+        }
+        for item in items
+    ]
+
+
+def _serialize_verifier_scores(scores: Dict[str, float]) -> List[Dict[str, object]]:
+    return [
+        {"doc_id": doc_id, "score": round(float(score), 6)}
+        for doc_id, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+
+def _build_episode_diagnostics_record(
+    episode: RestrictedRetrievalEpisode,
+    *,
+    reference_policy_type: str,
+    post_quote_search_budget: int,
+    mismatch_step_indices: List[int],
+    step_records: List[Dict[str, Any]],
+) -> Dict[str, object]:
+    return {
+        "episode_id": episode.episode_id,
+        "claim": episode.claim,
+        "label_hint": episode.label_hint,
+        "doc_pool": list(episode.doc_pool),
+        "gold_evidence": _serialize_evidence(episode.gold_evidence),
+        "reference_policy_type": reference_policy_type,
+        "post_quote_search_budget": post_quote_search_budget,
+        "num_steps": len(step_records),
+        "num_mismatches": len(mismatch_step_indices),
+        "mismatch_step_indices": mismatch_step_indices,
+        "steps": step_records,
+    }
+
+
+def _build_off_policy_action_record(
+    episode: RestrictedRetrievalEpisode,
+    *,
+    step_index: int,
+    state_text: str,
+    student_action: str,
+    reference_action: str,
+    is_first_off_policy_step: bool,
+    reference_policy_type: str,
+    post_quote_search_budget: int,
+    used_stop_policy: bool,
+    stop_policy_should_stop: Optional[bool],
+    suppressed_stop: bool,
+) -> Dict[str, object]:
+    return {
+        "trajectory_id": episode.episode_id,
+        "step_id": int(step_index),
+        "task": "next_action_classification",
+        "text": state_text,
+        "label": reference_action,
+        "label_text": json.dumps({"action_type": reference_action}, ensure_ascii=False),
+        "metadata": {
+            "episode_id": episode.episode_id,
+            "student_action": student_action,
+            "reference_action": reference_action,
+            "is_first_off_policy_step": is_first_off_policy_step,
+            "reference_policy_type": reference_policy_type,
+            "post_quote_search_budget": post_quote_search_budget,
+            "used_stop_policy": used_stop_policy,
+            "stop_policy_should_stop": stop_policy_should_stop,
+            "suppressed_stop": suppressed_stop,
+        },
+    }
+
+
+def _build_off_policy_stop_record(action_record: Dict[str, object]) -> Dict[str, object]:
+    stop_record = convert_action_record_to_stop_record(action_record)
+    metadata = action_record.get("metadata")
+    if metadata:
+        stop_record["metadata"] = dict(metadata)
+    return stop_record
+
+
 def evaluate_policy_on_episodes(
     episodes: Sequence[RestrictedRetrievalEpisode],
     *,
@@ -97,6 +183,9 @@ def evaluate_policy_on_episodes(
     post_quote_search_budget: int = 1,
     doc_aggregation: str = "full_document",
     aggregation_top_k: int = 3,
+    diagnostics_output_path: Optional[Path] = None,
+    off_policy_action_output_path: Optional[Path] = None,
+    off_policy_stop_output_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     episode_count = 0
     total_steps = 0
@@ -111,7 +200,14 @@ def evaluate_policy_on_episodes(
     stop_policy_yes_count = 0
     stop_policy_no_count = 0
     suppressed_stop_count = 0
+    mismatch_episode_count = 0
+    mismatch_step_count = 0
+    off_policy_episode_count = 0
     action_counts: Counter = Counter()
+    mismatch_episode_records: List[Dict[str, object]] = []
+    off_policy_action_records: List[Dict[str, object]] = []
+    off_policy_stop_records: List[Dict[str, object]] = []
+    capture_off_policy = off_policy_action_output_path is not None or off_policy_stop_output_path is not None
 
     for episode in episodes:
         reference_policy = _build_reference_policy(
@@ -128,11 +224,18 @@ def evaluate_policy_on_episodes(
         state = env.reset()
         done = False
         episode_count += 1
+        episode_step_records: List[Dict[str, Any]] = []
+        episode_mismatch_step_indices: List[int] = []
+        off_policy_started = False
+        off_policy_counted = False
         while not done:
             state_text = state.to_text()
             reference_action = reference_policy.choose_action(state)
+            stop_policy_decision: Optional[bool] = None
+            suppressed_stop = False
             if stop_policy is not None:
-                if stop_policy.predict_should_stop(state_text):
+                stop_policy_decision = bool(stop_policy.predict_should_stop(state_text))
+                if stop_policy_decision:
                     predicted_action = "stop"
                     stop_policy_yes_count += 1
                 else:
@@ -141,6 +244,49 @@ def evaluate_policy_on_episodes(
                     suppressed_stop_count += int(suppressed_stop)
             else:
                 predicted_action = action_policy.predict_action(state_text)
+
+            is_first_off_policy_step = False
+            if predicted_action != reference_action:
+                episode_mismatch_step_indices.append(state.step_index)
+                if not off_policy_started:
+                    off_policy_started = True
+                    is_first_off_policy_step = True
+
+            if capture_off_policy and off_policy_started:
+                if not off_policy_counted:
+                    off_policy_episode_count += 1
+                    off_policy_counted = True
+                action_record = _build_off_policy_action_record(
+                    episode,
+                    step_index=state.step_index,
+                    state_text=state_text,
+                    student_action=predicted_action,
+                    reference_action=reference_action,
+                    is_first_off_policy_step=is_first_off_policy_step,
+                    reference_policy_type=reference_policy_type,
+                    post_quote_search_budget=post_quote_search_budget,
+                    used_stop_policy=bool(stop_policy is not None),
+                    stop_policy_should_stop=stop_policy_decision,
+                    suppressed_stop=suppressed_stop,
+                )
+                if off_policy_action_output_path is not None:
+                    off_policy_action_records.append(action_record)
+                if off_policy_stop_output_path is not None:
+                    off_policy_stop_records.append(_build_off_policy_stop_record(action_record))
+
+            step_record: Dict[str, Any] = {
+                "step_index": state.step_index,
+                "state_text": state_text,
+                "reference_action": reference_action,
+                "predicted_action": predicted_action,
+                "action_match": predicted_action == reference_action,
+                "stop_policy_should_stop": stop_policy_decision,
+                "suppressed_stop": suppressed_stop,
+                "revealed_docs": list(state.revealed_docs),
+                "revealed_evidence": _serialize_evidence(state.revealed_evidence),
+                "quoted_evidence": _serialize_evidence(state.quoted_evidence),
+                "verifier_scores": _serialize_verifier_scores(state.verifier_scores),
+            }
 
             total_steps += 1
             action_counts[predicted_action] += 1
@@ -151,6 +297,17 @@ def evaluate_policy_on_episodes(
                 predicted_stop += 1
                 correct_stop += int(reference_action == "stop")
             result = env.step(predicted_action)
+            step_record.update(
+                {
+                    "reward": float(result.reward),
+                    "done": bool(result.done),
+                    "info": dict(result.info),
+                    "next_revealed_docs": list(result.state.revealed_docs),
+                    "next_revealed_evidence": _serialize_evidence(result.state.revealed_evidence),
+                    "next_quoted_evidence": _serialize_evidence(result.state.quoted_evidence),
+                }
+            )
+            episode_step_records.append(step_record)
             if predicted_action == "quote_evidence":
                 predicted_quote += 1
                 quote_hits += int(result.info.get("invalid_action") != "quote_evidence")
@@ -159,6 +316,40 @@ def evaluate_policy_on_episodes(
                 early_stops += int(bool(result.info.get("early_stop", False)))
             state = result.state
             done = result.done
+
+        if episode_mismatch_step_indices:
+            mismatch_episode_count += 1
+            mismatch_step_count += len(episode_mismatch_step_indices)
+            mismatch_episode_records.append(
+                _build_episode_diagnostics_record(
+                    episode,
+                    reference_policy_type=reference_policy_type,
+                    post_quote_search_budget=post_quote_search_budget,
+                    mismatch_step_indices=episode_mismatch_step_indices,
+                    step_records=episode_step_records,
+                )
+            )
+
+    if diagnostics_output_path is not None:
+        diagnostics_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with diagnostics_output_path.open("w", encoding="utf-8") as handle:
+            for record in mismatch_episode_records:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
+
+    if off_policy_action_output_path is not None:
+        off_policy_action_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with off_policy_action_output_path.open("w", encoding="utf-8") as handle:
+            for record in off_policy_action_records:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
+
+    if off_policy_stop_output_path is not None:
+        off_policy_stop_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with off_policy_stop_output_path.open("w", encoding="utf-8") as handle:
+            for record in off_policy_stop_records:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
 
     summary = {
         "episodes": episode_count,
@@ -179,6 +370,14 @@ def evaluate_policy_on_episodes(
         "suppressed_stop_count": suppressed_stop_count,
         "reference_policy_type": reference_policy_type,
         "post_quote_search_budget": post_quote_search_budget,
+        "mismatch_episode_count": mismatch_episode_count,
+        "mismatch_step_count": mismatch_step_count,
+        "diagnostics_output_path": str(diagnostics_output_path) if diagnostics_output_path is not None else "",
+        "off_policy_episode_count": off_policy_episode_count,
+        "off_policy_action_examples": len(off_policy_action_records),
+        "off_policy_stop_examples": len(off_policy_stop_records),
+        "off_policy_action_output_path": str(off_policy_action_output_path) if off_policy_action_output_path is not None else "",
+        "off_policy_stop_output_path": str(off_policy_stop_output_path) if off_policy_stop_output_path is not None else "",
     }
     return summary
 
@@ -189,6 +388,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop_model_dir", type=Path)
     parser.add_argument("--verifier_model_name_or_path", required=True)
     parser.add_argument("--output_path", type=Path, required=True)
+    parser.add_argument("--diagnostics_output_path", type=Path)
+    parser.add_argument("--off_policy_action_output_path", type=Path)
+    parser.add_argument("--off_policy_stop_output_path", type=Path)
     parser.add_argument("--split", default="validation")
     parser.add_argument("--max_steps", type=int, default=4)
     parser.add_argument("--policy_max_length", type=int, default=768)
@@ -259,6 +461,9 @@ def main() -> None:
         post_quote_search_budget=args.post_quote_search_budget,
         doc_aggregation=args.doc_aggregation,
         aggregation_top_k=args.aggregation_top_k,
+        diagnostics_output_path=args.diagnostics_output_path,
+        off_policy_action_output_path=args.off_policy_action_output_path,
+        off_policy_stop_output_path=args.off_policy_stop_output_path,
     )
     summary.update(
         {
@@ -271,6 +476,9 @@ def main() -> None:
             "num_distractor_docs": args.num_distractor_docs,
             "reference_policy_type": args.reference_policy_type,
             "post_quote_search_budget": args.post_quote_search_budget,
+            "diagnostics_output_path": str(args.diagnostics_output_path) if args.diagnostics_output_path is not None else "",
+            "off_policy_action_output_path": str(args.off_policy_action_output_path) if args.off_policy_action_output_path is not None else "",
+            "off_policy_stop_output_path": str(args.off_policy_stop_output_path) if args.off_policy_stop_output_path is not None else "",
         }
     )
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
