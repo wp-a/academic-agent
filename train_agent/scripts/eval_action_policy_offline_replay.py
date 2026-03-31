@@ -9,11 +9,45 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from datasets import load_dataset
 
 from train_agent.data.adapters.scifact import build_scifact_restricted_episode
+from train_agent.data.adapters.scifact_hard import augment_episode_with_lexical_distractors
 from train_agent.models.action_policy import FrozenActionPolicy
 from train_agent.models.stop_policy import FrozenStopPolicy
 from train_agent.models.verifier import FrozenSequenceVerifier
 from train_agent.rl.restricted_retrieval import RestrictedRetrievalEpisode, RestrictedRetrievalEnv
 from train_agent.scripts.export_scifact_frozen_verifier_replay import WeakCoupledReplayPolicy, build_scifact_corpus_map
+
+
+def build_corpus_text_by_doc(corpus_map: Dict[str, object]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for doc_id, payload in corpus_map.items():
+        abstract = payload.get("abstract") or payload.get("sentences") or payload.get("lines") or []
+        result[str(doc_id)] = " ".join(str(sentence) for sentence in abstract)
+    return result
+
+
+def build_corpus_sentences_by_doc(corpus_map: Dict[str, object]) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    for doc_id, payload in corpus_map.items():
+        abstract = payload.get("abstract") or payload.get("sentences") or payload.get("lines") or []
+        result[str(doc_id)] = [str(sentence) for sentence in abstract]
+    return result
+
+
+def maybe_augment_episode_for_hard_eval(
+    episode: RestrictedRetrievalEpisode,
+    *,
+    corpus_text_by_doc: Dict[str, str],
+    corpus_sentences_by_doc: Dict[str, List[str]],
+    num_distractor_docs: int,
+) -> RestrictedRetrievalEpisode:
+    if num_distractor_docs <= 0:
+        return episode
+    return augment_episode_with_lexical_distractors(
+        episode=episode,
+        corpus_text_by_doc=corpus_text_by_doc,
+        corpus_sentences_by_doc=corpus_sentences_by_doc,
+        num_distractor_docs=num_distractor_docs,
+    )
 
 
 def choose_action_with_optional_stop_suppression(action_policy, state_text: str) -> Tuple[str, bool]:
@@ -142,6 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--doc_aggregation", default="full_document")
     parser.add_argument("--aggregation_top_k", type=int, default=3)
+    parser.add_argument("--num_distractor_docs", type=int, default=0)
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
 
@@ -153,11 +188,21 @@ def main() -> None:
     corpus = corpus_dataset[list(corpus_dataset.keys())[0]]
     corpus_map = build_scifact_corpus_map(corpus)
 
+    corpus_text_by_doc = build_corpus_text_by_doc(corpus_map) if args.num_distractor_docs > 0 else {}
+    corpus_sentences_by_doc = build_corpus_sentences_by_doc(corpus_map) if args.num_distractor_docs > 0 else {}
+
     episodes: List[RestrictedRetrievalEpisode] = []
     for row in claims:
         episode = build_scifact_restricted_episode(dict(row), corpus=corpus_map, max_steps=args.max_steps)
-        if episode.gold_evidence:
-            episodes.append(episode)
+        if not episode.gold_evidence:
+            continue
+        episode = maybe_augment_episode_for_hard_eval(
+            episode,
+            corpus_text_by_doc=corpus_text_by_doc,
+            corpus_sentences_by_doc=corpus_sentences_by_doc,
+            num_distractor_docs=args.num_distractor_docs,
+        )
+        episodes.append(episode)
 
     verifier = FrozenSequenceVerifier(
         args.verifier_model_name_or_path,
@@ -195,6 +240,7 @@ def main() -> None:
             "verifier_model_name_or_path": args.verifier_model_name_or_path,
             "doc_aggregation": args.doc_aggregation,
             "aggregation_top_k": args.aggregation_top_k,
+            "num_distractor_docs": args.num_distractor_docs,
         }
     )
     args.output_path.parent.mkdir(parents=True, exist_ok=True)

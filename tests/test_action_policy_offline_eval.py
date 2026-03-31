@@ -1,7 +1,10 @@
 import unittest
 
 from train_agent.rl.restricted_retrieval import RestrictedEvidence, RestrictedRetrievalEpisode
-from train_agent.scripts.eval_action_policy_offline_replay import evaluate_policy_on_episodes
+from train_agent.scripts.eval_action_policy_offline_replay import (
+    evaluate_policy_on_episodes,
+    maybe_augment_episode_for_hard_eval,
+)
 
 
 class DummyVerifier:
@@ -42,6 +45,44 @@ class DummyStopPolicy:
 
 
 class ActionPolicyOfflineEvalTest(unittest.TestCase):
+    def test_maybe_augment_episode_for_hard_eval_appends_lexical_distractors(self):
+        episode = RestrictedRetrievalEpisode(
+            episode_id="ep-1",
+            claim="tree canopy lowers summer temperature in cities",
+            label_hint="SUPPORT",
+            doc_pool=["doc-good"],
+            gold_evidence=[
+                RestrictedEvidence(
+                    doc_id="doc-good",
+                    sentence_ids=[0],
+                    stance="SUPPORT",
+                    snippet="Tree canopy lowers urban temperature.",
+                )
+            ],
+            document_contents={"doc-good": "Tree canopy lowers urban temperature."},
+            document_sentences={"doc-good": ["Tree canopy lowers urban temperature."]},
+            max_steps=5,
+        )
+
+        augmented = maybe_augment_episode_for_hard_eval(
+            episode,
+            corpus_text_by_doc={
+                "doc-good": "Tree canopy lowers urban temperature.",
+                "doc-hard": "Urban tree canopy overlap with summer temperature patterns.",
+                "doc-easy": "Protein folding in yeast cells.",
+            },
+            corpus_sentences_by_doc={
+                "doc-good": ["Tree canopy lowers urban temperature."],
+                "doc-hard": ["Urban tree canopy overlap with summer temperature patterns."],
+                "doc-easy": ["Protein folding in yeast cells."],
+            },
+            num_distractor_docs=1,
+        )
+
+        self.assertEqual(augmented.doc_pool, ["doc-good", "doc-hard"])
+        self.assertIn("doc-hard", augmented.document_contents)
+        self.assertEqual(augmented.gold_evidence[0].doc_id, "doc-good")
+
     def test_evaluate_policy_on_episodes_reports_episode_metrics(self):
         episode = RestrictedRetrievalEpisode(
             episode_id="ep-1",
