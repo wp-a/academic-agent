@@ -44,6 +44,38 @@ class DummyStopPolicy:
         return "Action: quote_evidence" in text
 
 
+def build_single_doc_episode() -> RestrictedRetrievalEpisode:
+    return RestrictedRetrievalEpisode(
+        episode_id="ep-1",
+        claim="Claim",
+        label_hint="SUPPORT",
+        doc_pool=["doc-good"],
+        gold_evidence=[RestrictedEvidence(doc_id="doc-good", sentence_ids=[0], stance="SUPPORT", snippet="Evidence")],
+        document_contents={"doc-good": "Evidence sentence."},
+        document_sentences={"doc-good": ["Evidence sentence."]},
+        max_steps=4,
+    )
+
+
+def build_distractor_episode() -> RestrictedRetrievalEpisode:
+    return RestrictedRetrievalEpisode(
+        episode_id="ep-hard",
+        claim="Claim",
+        label_hint="SUPPORT",
+        doc_pool=["doc-good", "doc-hard"],
+        gold_evidence=[RestrictedEvidence(doc_id="doc-good", sentence_ids=[0], stance="SUPPORT", snippet="Evidence")],
+        document_contents={
+            "doc-good": "Evidence sentence.",
+            "doc-hard": "Distractor sentence.",
+        },
+        document_sentences={
+            "doc-good": ["Evidence sentence."],
+            "doc-hard": ["Distractor sentence."],
+        },
+        max_steps=5,
+    )
+
+
 class ActionPolicyOfflineEvalTest(unittest.TestCase):
     def test_maybe_augment_episode_for_hard_eval_appends_lexical_distractors(self):
         episode = RestrictedRetrievalEpisode(
@@ -84,18 +116,8 @@ class ActionPolicyOfflineEvalTest(unittest.TestCase):
         self.assertEqual(augmented.gold_evidence[0].doc_id, "doc-good")
 
     def test_evaluate_policy_on_episodes_reports_episode_metrics(self):
-        episode = RestrictedRetrievalEpisode(
-            episode_id="ep-1",
-            claim="Claim",
-            label_hint="SUPPORT",
-            doc_pool=["doc-good"],
-            gold_evidence=[RestrictedEvidence(doc_id="doc-good", sentence_ids=[0], stance="SUPPORT", snippet="Evidence")],
-            document_contents={"doc-good": "Evidence sentence."},
-            document_sentences={"doc-good": ["Evidence sentence."]},
-            max_steps=4,
-        )
         summary = evaluate_policy_on_episodes(
-            [episode],
+            [build_single_doc_episode()],
             verifier=DummyVerifier(),
             action_policy=DummyPolicy(),
             doc_aggregation="full_document",
@@ -108,18 +130,8 @@ class ActionPolicyOfflineEvalTest(unittest.TestCase):
         self.assertAlmostEqual(summary["quote_evidence_hit_rate"], 1.0, places=6)
 
     def test_evaluate_policy_on_episodes_can_gate_stop_with_stop_policy(self):
-        episode = RestrictedRetrievalEpisode(
-            episode_id="ep-1",
-            claim="Claim",
-            label_hint="SUPPORT",
-            doc_pool=["doc-good"],
-            gold_evidence=[RestrictedEvidence(doc_id="doc-good", sentence_ids=[0], stance="SUPPORT", snippet="Evidence")],
-            document_contents={"doc-good": "Evidence sentence."},
-            document_sentences={"doc-good": ["Evidence sentence."]},
-            max_steps=4,
-        )
         summary = evaluate_policy_on_episodes(
-            [episode],
+            [build_single_doc_episode()],
             verifier=DummyVerifier(),
             action_policy=DummyJointActionPolicy(),
             stop_policy=DummyStopPolicy(),
@@ -133,6 +145,44 @@ class ActionPolicyOfflineEvalTest(unittest.TestCase):
         self.assertAlmostEqual(summary["action_agreement"], 1.0, places=6)
         self.assertAlmostEqual(summary["stop_precision"], 1.0, places=6)
         self.assertAlmostEqual(summary["stop_recall"], 1.0, places=6)
+
+    def test_evaluate_policy_on_episodes_supports_conservative_reference_policy(self):
+        summary = evaluate_policy_on_episodes(
+            [build_distractor_episode()],
+            verifier=DummyVerifier(),
+            action_policy=DummyPolicy(),
+            reference_policy_type="conservative",
+            post_quote_search_budget=1,
+            doc_aggregation="full_document",
+            aggregation_top_k=3,
+        )
+        self.assertEqual(summary["reference_policy_type"], "conservative")
+        self.assertEqual(summary["post_quote_search_budget"], 1)
+        self.assertAlmostEqual(summary["action_agreement"], 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(summary["stop_recall"], 0.0, places=6)
+
+    def test_conservative_reference_differs_from_weak_on_distractor_episode(self):
+        weak_summary = evaluate_policy_on_episodes(
+            [build_distractor_episode()],
+            verifier=DummyVerifier(),
+            action_policy=DummyPolicy(),
+            reference_policy_type="weak",
+            post_quote_search_budget=1,
+            doc_aggregation="full_document",
+            aggregation_top_k=3,
+        )
+        conservative_summary = evaluate_policy_on_episodes(
+            [build_distractor_episode()],
+            verifier=DummyVerifier(),
+            action_policy=DummyPolicy(),
+            reference_policy_type="conservative",
+            post_quote_search_budget=1,
+            doc_aggregation="full_document",
+            aggregation_top_k=3,
+        )
+        self.assertAlmostEqual(weak_summary["action_agreement"], 1.0, places=6)
+        self.assertLess(conservative_summary["action_agreement"], weak_summary["action_agreement"])
+        self.assertNotEqual(weak_summary["stop_recall"], conservative_summary["stop_recall"])
 
 
 if __name__ == "__main__":

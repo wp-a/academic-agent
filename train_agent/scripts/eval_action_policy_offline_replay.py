@@ -15,6 +15,7 @@ from train_agent.models.stop_policy import FrozenStopPolicy
 from train_agent.models.verifier import FrozenSequenceVerifier
 from train_agent.rl.restricted_retrieval import RestrictedRetrievalEpisode, RestrictedRetrievalEnv
 from train_agent.scripts.export_scifact_frozen_verifier_replay import WeakCoupledReplayPolicy, build_scifact_corpus_map
+from train_agent.scripts.export_scifact_hard_replay_data import ConservativeReplayPolicy
 
 
 def build_corpus_text_by_doc(corpus_map: Dict[str, object]) -> Dict[str, str]:
@@ -70,17 +71,33 @@ def choose_action_with_optional_stop_suppression(action_policy, state_text: str)
     return predicted_action, False
 
 
+def _build_reference_policy(
+    episode: RestrictedRetrievalEpisode,
+    *,
+    reference_policy_type: str,
+    post_quote_search_budget: int,
+):
+    if reference_policy_type == "conservative":
+        return ConservativeReplayPolicy(
+            gold_doc_ids={item.doc_id for item in episode.gold_evidence},
+            post_quote_search_budget=post_quote_search_budget,
+        )
+    if reference_policy_type == "weak":
+        return WeakCoupledReplayPolicy()
+    raise ValueError(f"Unsupported reference_policy_type: {reference_policy_type}")
+
+
 def evaluate_policy_on_episodes(
     episodes: Sequence[RestrictedRetrievalEpisode],
     *,
     verifier: FrozenSequenceVerifier,
     action_policy: FrozenActionPolicy,
     stop_policy: Optional[FrozenStopPolicy] = None,
-    reference_policy: Optional[WeakCoupledReplayPolicy] = None,
+    reference_policy_type: str = "weak",
+    post_quote_search_budget: int = 1,
     doc_aggregation: str = "full_document",
     aggregation_top_k: int = 3,
 ) -> Dict[str, object]:
-    reference_policy = reference_policy or WeakCoupledReplayPolicy()
     episode_count = 0
     total_steps = 0
     agreement = 0
@@ -97,6 +114,11 @@ def evaluate_policy_on_episodes(
     action_counts: Counter = Counter()
 
     for episode in episodes:
+        reference_policy = _build_reference_policy(
+            episode,
+            reference_policy_type=reference_policy_type,
+            post_quote_search_budget=post_quote_search_budget,
+        )
         env = RestrictedRetrievalEnv(
             episode,
             frozen_verifier=verifier,
@@ -155,6 +177,8 @@ def evaluate_policy_on_episodes(
         "stop_policy_yes_count": stop_policy_yes_count,
         "stop_policy_no_count": stop_policy_no_count,
         "suppressed_stop_count": suppressed_stop_count,
+        "reference_policy_type": reference_policy_type,
+        "post_quote_search_budget": post_quote_search_budget,
     }
     return summary
 
@@ -177,6 +201,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--doc_aggregation", default="full_document")
     parser.add_argument("--aggregation_top_k", type=int, default=3)
     parser.add_argument("--num_distractor_docs", type=int, default=0)
+    parser.add_argument("--reference_policy_type", choices=["weak", "conservative"], default="weak")
+    parser.add_argument("--post_quote_search_budget", type=int, default=1)
     parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
 
@@ -229,6 +255,8 @@ def main() -> None:
         verifier=verifier,
         action_policy=action_policy,
         stop_policy=stop_policy,
+        reference_policy_type=args.reference_policy_type,
+        post_quote_search_budget=args.post_quote_search_budget,
         doc_aggregation=args.doc_aggregation,
         aggregation_top_k=args.aggregation_top_k,
     )
@@ -241,6 +269,8 @@ def main() -> None:
             "doc_aggregation": args.doc_aggregation,
             "aggregation_top_k": args.aggregation_top_k,
             "num_distractor_docs": args.num_distractor_docs,
+            "reference_policy_type": args.reference_policy_type,
+            "post_quote_search_budget": args.post_quote_search_budget,
         }
     )
     args.output_path.parent.mkdir(parents=True, exist_ok=True)

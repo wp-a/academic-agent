@@ -130,7 +130,7 @@
 
 - 通过 `train_agent/data/adapters/scifact_hard.py` 为每个 episode 追加词汇重叠但非 gold 的干扰文档
 - 通过 `train_agent/scripts/export_scifact_hard_replay_data.py` 导出更保守 teacher 的 action / stop 数据
-- 通过 `train_agent/scripts/eval_action_policy_offline_replay.py --num_distractor_docs N` 在 offline replay 中打开 hard episode
+- 通过 `train_agent/scripts/eval_action_policy_offline_replay.py --num_distractor_docs N --reference_policy_type conservative --post_quote_search_budget 1` 在 offline replay 中打开与 hard 导出 teacher 对齐的评测
 
 ## 3. 目录结构
 
@@ -288,10 +288,12 @@ hard replay joint 输出：
 
 - `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1`
 - validation `success_rate = 0.97929`
-- validation `action_agreement = 0.814788`
-- validation `stop_precision = 0.996855`
-- validation `stop_recall = 0.552265`
-- validation `quote_evidence_hit_rate = 0.993994`
+- validation `action_agreement = 0.998564`
+- validation `stop_precision = 0.996865`
+- validation `stop_recall = 0.996865`
+- validation `quote_evidence_hit_rate = 1.0`
+- validation `reference_policy_type = conservative`
+- validation `post_quote_search_budget = 1`
 
 ## 7. 关键命令
 
@@ -357,7 +359,7 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_
 ### 7.8 运行 hard joint offline replay 评测
 
 ```sh
-docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3"
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3 --reference_policy_type conservative --post_quote_search_budget 1"
 ```
 
 ## 8. 当前结论
@@ -383,23 +385,25 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 - 还不能把当前高分直接等价为最终 agent 能力
 - 当前 `Qwen action + Qwen stop` 在 easy replay 上已经非常接近饱和
 - hard replay 已经把 validation 平均步数拉到 `4.12`，`search` 比例拉到 `0.533`
-- hard replay 上 step-level 分类仍接近饱和，但 joint offline replay 已不再是 easy replay 的 `1.0` 复现
+- hard replay 上 step-level 分类仍接近饱和，但对齐 `ConservativeReplayPolicy` 后 joint offline replay 也基本复现了 hard teacher
+- 这说明前一版 `0.814788 / 0.552265` 的主要来源是 eval reference teacher 与导出 teacher 不一致，而不是 hard student 本身显著退化
 
-### 8.3 关于 hard replay 结果的 caveat
+### 8.3 关于 hard replay 结果的当前解释
 
 - hard replay 数据导出使用的是 `ConservativeReplayPolicy`
-- 当前 `eval_action_policy_offline_replay.py` 在计算 `action_agreement / stop_recall` 时仍默认拿 `WeakCoupledReplayPolicy` 作为 reference policy
-- 因此 `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json` 里的 `action_agreement=0.814788` 与 `stop_recall=0.552265` 已经说明 hard 集成难度上来了，但还不能当成完全 teacher-aligned 的最终结论
+- `eval_action_policy_offline_replay.py` 现已支持 `--reference_policy_type {weak,conservative}` 与 `--post_quote_search_budget`
+- 当前 hard joint 指标应使用 teacher-aligned 的 conservative reference 结果来解读
+- 对齐后 `action_agreement = 0.998564`、`stop_recall = 0.996865`
+- 旧的 `0.814788 / 0.552265` 是 reference mismatch 造成的历史结果，不应继续作为当前主结论
 
 ## 9. 下一步建议
 
 建议按下面顺序继续推进：
 
 1. 保持 frozen verifier 不动
-2. 先把 hard replay offline eval 的 reference teacher 与导出 teacher 对齐
-3. 再对 hard replay episode 做更严格的 disagreement / stop 失败诊断
-4. 然后继续扩展 action policy / stop policy replay 数据和评测切面
-5. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
+2. 直接对 hard replay 中剩余的少量 mismatch episode 做更严格的 disagreement / stop 失败诊断
+3. 然后继续扩展 action policy / stop policy replay 数据和评测切面
+4. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
 
 当前不建议直接做：
 
