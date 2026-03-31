@@ -13,12 +13,12 @@
 
 - SciFact `decomposed verifier` 路线
 - frozen verifier 下的 restricted ranking 评测
-- weakly-coupled action policy 数据导出
+- weakly-coupled replay 的 action / stop 数据导出
+- hard replay 的 action / stop 数据导出
 - action policy 小分类 baseline
 - `Qwen2.5-3B-Instruct` LoRA action policy 主线
-- SciFact stop-policy replay 数据导出
 - `Qwen2.5-3B-Instruct` LoRA stop policy 主线
-- action-level 与 episode-level offline replay 评测
+- easy / hard 两套 action-level 与 episode-level offline replay 评测
 
 当前明确不做：
 
@@ -55,7 +55,7 @@
 它是当前 frozen verifier 的主线基线，用于：
 
 - restricted env 文档揭示顺序
-- SciFact weakly-coupled action replay 导出
+- SciFact weak replay / hard replay 数据导出
 - offline replay 环境中的 verifier side signal
 
 当前 stance 头保持为 decomposed verifier 结构的一部分，但本阶段不继续扩展它。
@@ -70,10 +70,20 @@
 
 输入是 verifier 驱动环境状态的 `state_text`，输出是离散 `action_type`。
 
-当前已经跑通两条线：
+当前真实 `state_text` 由 `train_agent/rl/restricted_retrieval.py` 里的 `RestrictedRetrievalState.to_text()` 生成，包含：
+
+- `claim`
+- `current observation`
+- `history`
+- `verifier summary`
+- `evidence`
+- `action space`
+
+当前已经跑通三条线：
 
 - 小分类 baseline：`prajjwal1/bert-tiny`
-- 主力 baseline：`Qwen2.5-3B-Instruct` + LoRA
+- easy replay 主力 baseline：`Qwen2.5-3B-Instruct` + LoRA
+- hard replay 主力 baseline：`Qwen2.5-3B-Instruct` + LoRA
 
 ### 2.3 Stop Policy 主线
 
@@ -86,13 +96,16 @@
 
 当前已经跑通：
 
-- SciFact weakly-coupled replay stop 数据导出
+- SciFact weak replay stop 数据导出
+- SciFact hard replay stop 数据导出
 - `Qwen2.5-3B-Instruct` + LoRA stop policy 四卡训练
 
 当前最新验证结果：
 
-- validation `accuracy = 1.0`
-- validation `macro_f1 = 1.0`
+- weak replay validation `accuracy = 1.0`
+- weak replay validation `macro_f1 = 1.0`
+- hard replay validation `accuracy = 0.998563`
+- hard replay validation `macro_f1 = 0.997962`
 
 ### 2.4 评测方式
 
@@ -113,6 +126,12 @@
    - `success_rate`
    - `early_stop_rate`
 
+当前除了 weak replay 以外，还支持带 lexical distractor 的 hard replay：
+
+- 通过 `train_agent/data/adapters/scifact_hard.py` 为每个 episode 追加词汇重叠但非 gold 的干扰文档
+- 通过 `train_agent/scripts/export_scifact_hard_replay_data.py` 导出更保守 teacher 的 action / stop 数据
+- 通过 `train_agent/scripts/eval_action_policy_offline_replay.py --num_distractor_docs N` 在 offline replay 中打开 hard episode
+
 ## 3. 目录结构
 
 ### 3.1 训练与数据
@@ -122,7 +141,7 @@
 - `train_agent/trajectories/`
   - trajectory schema 与历史导出逻辑
 - `train_agent/models/`
-  - frozen verifier / frozen action policy 推理封装
+  - frozen verifier / frozen action policy / frozen stop policy 推理封装
 - `train_agent/trainers/`
   - `train_verifier.py`
   - `train_action_policy.py`
@@ -132,8 +151,8 @@
   - action policy metrics
 - `train_agent/scripts/`
   - SciFact verifier 数据导出
-  - action policy replay 数据导出
-  - stop policy replay 数据导出
+  - easy replay action / stop 数据导出
+  - hard replay action / stop 数据导出
   - step-level classification 评测与错例导出
   - offline replay 评测
   - inference / utility 脚本
@@ -184,11 +203,12 @@ export NO_PROXY=localhost,127.0.0.1
 
 ## 6. 当前已验证的数据与产物
 
-### 6.1 SciFact action-policy replay 数据
+### 6.1 SciFact easy replay 数据
 
 当前 replay 数据目录：
 
 - `data/processed/scifact_action_policy_v1/`
+- `data/processed/scifact_stop_policy_v1/`
 
 当前导出设置：
 
@@ -201,19 +221,81 @@ export NO_PROXY=localhost,127.0.0.1
 - train：`957` episodes，`2974` action examples
 - validation：`338` episodes，`1046` action examples
 
-### 6.2 Action policy 模型输出
+### 6.2 SciFact hard replay 数据
+
+当前 hard replay 数据目录：
+
+- `data/processed/scifact_hard_replay_v1/`
+
+当前导出设置：
+
+- frozen verifier：`outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin`
+- doc aggregation：`full_document`
+- max steps：`5`
+- lexical distractors：`3`
+- post quote search budget：`1`
+
+当前数据规模：
+
+- train action：`957` episodes，`3940` examples，平均 `4.117032` steps
+- validation action：`338` episodes，`1392` examples，平均 `4.118343` steps
+- validation action 分布：`quote_evidence=0.238506`，`search=0.533046`，`stop=0.228448`
+- validation stop 分布：`no=0.771552`，`yes=0.228448`
+
+### 6.3 Verifier 产物
+
+当前 frozen verifier 主线：
+
+- `outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin`
+
+它是 easy / hard replay 导出与 offline replay 的共同依赖。
+
+### 6.4 Action policy 模型输出
 
 小分类 baseline：
 
 - `outputs/action_policy_scifact_bert_tiny_v1`
 
-Qwen LoRA 主线：
+Qwen LoRA easy replay 主线：
 
 - `outputs/action_policy_scifact_qwen25_3b_lora_v1`
 
+Qwen LoRA hard replay 主线：
+
+- `outputs/action_policy_scifact_hard_qwen25_3b_lora_v1`
+- validation `accuracy = 0.997845`
+- validation `macro_f1 = 0.997776`
+
+### 6.5 Stop policy 模型输出
+
+Qwen LoRA easy replay 主线：
+
+- `outputs/stop_policy_scifact_qwen25_3b_lora_v1`
+
+Qwen LoRA hard replay 主线：
+
+- `outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1`
+- validation `accuracy = 0.998563`
+- validation `macro_f1 = 0.997962`
+
+### 6.6 Joint offline replay 输出
+
+weak replay joint 输出：
+
+- `outputs/joint_policy_scifact_qwen25_3b_lora_v1`
+
+hard replay joint 输出：
+
+- `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1`
+- validation `success_rate = 0.97929`
+- validation `action_agreement = 0.814788`
+- validation `stop_precision = 0.996855`
+- validation `stop_recall = 0.552265`
+- validation `quote_evidence_hit_rate = 0.993994`
+
 ## 7. 关键命令
 
-### 7.1 导出 SciFact action-policy replay 数据
+### 7.1 导出 SciFact easy replay action 数据
 
 ```sh
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.export_scifact_action_policy_data --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_dir data/processed/scifact_action_policy_v1 --max_steps 4 --doc_aggregation full_document --aggregation_top_k 3 --max_length 384 --batch_size 8"
@@ -266,6 +348,18 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_qwen25_3b_lora_v1/offline_replay_validation.json --split validation --max_steps 4 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3"
 ```
 
+### 7.7 导出 SciFact hard replay 数据
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export HTTP_PROXY=http://172.17.0.1:17898 && export HTTPS_PROXY=http://172.17.0.1:17898 && export NO_PROXY=localhost,127.0.0.1 && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.export_scifact_hard_replay_data --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_dir data/processed/scifact_hard_replay_v1 --max_steps 5 --num_distractor_docs 3 --post_quote_search_budget 1 --doc_aggregation full_document --aggregation_top_k 3 --max_length 384 --batch_size 8"
+```
+
+### 7.8 运行 hard joint offline replay 评测
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3"
+```
+
 ## 8. 当前结论
 
 ### 8.1 关于 verifier
@@ -284,20 +378,27 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 
 但需要明确：
 
-- 当前 replay supervision 仍来自 weak policy
-- 当前结果证明的是接口和 imitation pipeline 稳定
+- 当前 easy replay supervision 仍来自 weak policy
+- 当前高分首先证明的是接口和 imitation pipeline 稳定
 - 还不能把当前高分直接等价为最终 agent 能力
-- 当前 `Qwen action + Qwen stop` 联合 replay 与 action-only replay 基本一致，说明这套 SciFact weak replay 已接近饱和
-- 下一步更值得投入的是更大、更难、更多样的数据，而不是单纯在同一 weak replay 上继续加 epoch
+- 当前 `Qwen action + Qwen stop` 在 easy replay 上已经非常接近饱和
+- hard replay 已经把 validation 平均步数拉到 `4.12`，`search` 比例拉到 `0.533`
+- hard replay 上 step-level 分类仍接近饱和，但 joint offline replay 已不再是 easy replay 的 `1.0` 复现
+
+### 8.3 关于 hard replay 结果的 caveat
+
+- hard replay 数据导出使用的是 `ConservativeReplayPolicy`
+- 当前 `eval_action_policy_offline_replay.py` 在计算 `action_agreement / stop_recall` 时仍默认拿 `WeakCoupledReplayPolicy` 作为 reference policy
+- 因此 `outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json` 里的 `action_agreement=0.814788` 与 `stop_recall=0.552265` 已经说明 hard 集成难度上来了，但还不能当成完全 teacher-aligned 的最终结论
 
 ## 9. 下一步建议
 
 建议按下面顺序继续推进：
 
 1. 保持 frozen verifier 不动
-2. 继续扩展 action policy / stop policy replay 数据和评测切面
-3. 在 weakly-coupled 条件下加入更严格的 episode-level 诊断与 joint replay 诊断
-4. 优先引入更大、更难的数据源，而不是继续在同一弱标签集上刷更多 epoch
+2. 先把 hard replay offline eval 的 reference teacher 与导出 teacher 对齐
+3. 再对 hard replay episode 做更严格的 disagreement / stop 失败诊断
+4. 然后继续扩展 action policy / stop policy replay 数据和评测切面
 5. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
 
 当前不建议直接做：
