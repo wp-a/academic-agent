@@ -16,6 +16,10 @@
 - weakly-coupled replay 的 action / stop 数据导出
 - hard replay 的 action / stop 数据导出
 - hard replay residual mismatch episode diagnostics 与 student-visited off-policy state 导出
+- hard replay residual mismatch analysis
+- stronger teacher relabel schema、uncertain-skip 分流与 merge / mixed-train 工具链
+- 最小 DAgger round driver
+- `teacher_backend=llm_api` stronger teacher 后端接入
 - action policy 小分类 baseline
 - `Qwen2.5-3B-Instruct` LoRA action policy 主线
 - `Qwen2.5-3B-Instruct` LoRA stop policy 主线
@@ -322,6 +326,79 @@ hard replay joint 输出：
 - `3` 条 action records
 - `3` 条 stop records
 
+### 6.8 Hard replay mismatch analysis 与 DAgger 闭环产物
+
+当前新增的 hard replay mismatch analysis 工具：
+
+- `train_agent/scripts/analyze_hard_replay_mismatches.py`
+
+它会直接消费：
+
+- diagnostics JSONL
+- off-policy action JSONL
+- off-policy stop JSONL
+
+并输出：
+
+- `bucket_counts`
+- `error_source_counts`
+- `first_mismatch_action_pairs`
+- `first_mismatch_stop_policy_should_stop`
+
+当前 hard validation 的 mismatch analysis 结论：
+
+- `bucket_counts = {oversearch_after_quote: 1, premature_stop_after_evidence: 1}`
+- `error_source_counts = {stop_policy_false_negative: 1, stop_policy_false_positive: 1}`
+
+当前新增的 stronger teacher / DAgger 工具链：
+
+- `train_agent/scripts/build_stronger_teacher_relabels.py`
+- `train_agent/scripts/merge_relabel_into_trainset.py`
+- `train_agent/scripts/build_mixed_trainset.py`
+- `train_agent/scripts/run_minimal_dagger_round.py`
+
+当前 stronger teacher relabel 输出保持训练兼容 schema，但额外保存：
+
+- `metadata.failure_bucket`
+- `metadata.teacher_backend`
+- `metadata.teacher_label_action`
+- `metadata.teacher_label_stop`
+- `metadata.teacher_confidence`
+- `metadata.relabel_decision_type`
+
+当前 relabel 还支持：
+
+- `uncertain_skip` 单独导出
+- `decision_type -> episode ids` 汇总
+- `teacher_backend = rule_based | llm_api`
+
+当前 `run_minimal_dagger_round.py` 已支持显式 preset：
+
+- `--preset export_relabel_mix_only`
+
+它只跑：
+
+- off-policy export
+- relabel
+- mixed-train build
+
+而不进入 smoke training / replay compare，便于先扩大 off-policy 收集来源。
+
+当前 leakage-safe train-split 最小 DAgger 结果：
+
+- train hard off-policy：`mismatch_episode_count = 1`
+- relabel 后：`action_records_relabeled = 2`，`stop_records_relabeled = 2`
+- mixed train 覆盖：action / stop 各 `2` 条 records
+
+当前最小 tiny smoke compare 结果：
+
+- action base validation `accuracy = 0.961925`
+- action mixed validation `accuracy = 0.971264`
+- stop base validation `accuracy = 0.915948`
+- stop mixed validation `accuracy = 0.932471`
+- hard validation joint replay `success_rate: 0.878698 -> 0.890533`
+- hard validation joint replay `stop_recall: 0.818841 -> 0.845070`
+
 ## 7. 关键命令
 
 ### 7.1 导出 SciFact easy replay action 数据
@@ -395,6 +472,46 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.eval_action_policy_offline_replay --policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard.json --diagnostics_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl --off_policy_action_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl --off_policy_stop_output_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl --split validation --max_steps 5 --policy_max_length 512 --policy_batch_size 8 --stop_max_length 512 --stop_batch_size 8 --verifier_max_length 384 --verifier_batch_size 8 --doc_aggregation full_document --aggregation_top_k 3 --num_distractor_docs 3 --reference_policy_type conservative --post_quote_search_budget 1"
 ```
 
+### 7.10 运行 hard replay mismatch analysis
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && /root/miniconda3/bin/python -m train_agent.scripts.analyze_hard_replay_mismatches --diagnostics_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl --off_policy_action_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl --off_policy_stop_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl"
+```
+
+### 7.11 构建 stronger teacher relabel
+
+rule-based：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && /root/miniconda3/bin/python -m train_agent.scripts.build_stronger_teacher_relabels --diagnostics_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl --off_policy_action_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl --off_policy_stop_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl --output_dir outputs/llm_relabel_validation_v1 --teacher_backend rule_based --teacher_type rule_based_stronger_teacher_v1 --teacher_version v1 --minimum_teacher_confidence high"
+```
+
+LLM API：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export OPENAI_API_KEY=... && export OPENAI_BASE_URL=... && /root/miniconda3/bin/python -m train_agent.scripts.build_stronger_teacher_relabels --diagnostics_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/offline_replay_validation_hard_mismatch_episodes.jsonl --off_policy_action_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_action_validation_hard.jsonl --off_policy_stop_path outputs/joint_policy_scifact_hard_qwen25_3b_lora_v1/off_policy_stop_validation_hard.jsonl --output_dir outputs/llm_relabel_validation_v1 --teacher_backend llm_api --teacher_type llm_stronger_teacher_v1 --teacher_version prompt_v1 --teacher_model_name your-model-name --minimum_teacher_confidence high"
+```
+
+### 7.12 构建 mixed trainset
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && /root/miniconda3/bin/python -m train_agent.scripts.build_mixed_trainset --base_dir data/processed/scifact_hard_replay_v1 --relabel_dir outputs/dagger_scifact_hard_train_rule_relabel_v1 --output_dir outputs/dagger_scifact_hard_train_rule_relabel_v1/mixed_train"
+```
+
+### 7.13 运行最小 DAgger round
+
+只跑 export / relabel / mix：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.run_minimal_dagger_round --preset export_relabel_mix_only --output_root outputs/minimal_dagger_round_collect_v1 --student_policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --student_stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --reference_policy_type conservative --post_quote_search_budget 1 --num_distractor_docs 3 --max_steps 5"
+```
+
+带 tiny smoke compare：
+
+```sh
+docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_VISIBLE_DEVICES=0 && /root/miniconda3/bin/python -m train_agent.scripts.run_minimal_dagger_round --output_root outputs/minimal_dagger_round_smoke_v1 --student_policy_model_dir outputs/action_policy_scifact_hard_qwen25_3b_lora_v1 --student_stop_model_dir outputs/stop_policy_scifact_hard_qwen25_3b_lora_v1 --verifier_model_name_or_path outputs/verifier_scifact_deberta_v3_large_relevance_v7_pairwise_margin --reference_policy_type conservative --post_quote_search_budget 1 --num_distractor_docs 3 --max_steps 5"
+```
+
 ## 8. 当前结论
 
 ### 8.1 关于 verifier
@@ -432,14 +549,23 @@ docker exec -i 2e230dfba7c5 bash -lc "cd /mnt/AcademicSubmission && export CUDA_
 - 当前 hard validation 的 residual mismatch 只剩 `2` 个 episodes / `2` 个 steps，主要是 stop gating 边界问题而不是整条策略崩坏
 - 当前已经能直接把这些 student-visited off-policy states 导出为训练就绪数据，为 stronger teacher 标注或 DAgger-style 增量训练做准备
 
+### 8.4 关于当前 DAgger 主线的解释
+
+- 当前已经具备从 `off-policy export -> stronger teacher relabel -> mixed train -> smoke compare` 的最小闭环
+- 当前 `teacher_backend=rule_based` 已经打通整条链路，`teacher_backend=llm_api` 已经接入但还未完成真实线上标注验证
+- 当前最小 DAgger 增量训练给出了正向信号，但 train split 上真实 mismatch 仍然过少
+- 当前最值得做的不是立刻换更大 student，而是扩大 off-policy 收集来源并验证真实 LLM stronger teacher 的标注质量
+- 当前 agent 仍然主要在模仿手写规则 teacher，不能把当前高分直接等价为“论文评审已经解决”
+
 ## 9. 下一步建议
 
 建议按下面顺序继续推进：
 
 1. 保持 frozen verifier 不动
-2. 用当前 off-policy 导出接口持续收集 student-visited rollout states，而不是只看聚合指标
-3. 在这些 off-policy states 上引入更强 teacher 标注，再做 DAgger-style 增量数据混入
-4. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop
+2. 优先使用 `run_minimal_dagger_round.py --preset export_relabel_mix_only` 扩大 off-policy 收集来源，而不是直接继续训练更复杂模型
+3. 在这些 off-policy states 上引入真实 LLM stronger teacher 标注，先看 `decision_type_distribution` 与 `uncertain_skip` 比例
+4. 再把可接受的 relabel 数据混入训练集，做 leakage-safe 的 DAgger-style 增量训练
+5. 等 joint replay 在更强数据上仍稳定后，再考虑更正式的 agent loop 与 reviewer-level head
 
 当前不建议直接做：
 
